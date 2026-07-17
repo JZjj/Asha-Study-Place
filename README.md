@@ -1,8 +1,10 @@
-# Efficient AI &amp; ML Systems — Study Notes
+# Asha's Study Place
 
-Student revision notes for the efficient–deep-learning course (**NYU SAI Lab, Spring 2026**), covering model compression, LLM efficiency, distributed training, and hardware accelerators. Each lecture is distilled into a single, self-contained HTML page with the key formulas, trade-offs, and an exam recap.
+A calm static-HTML study room for efficient AI and ML systems notes. The materials come from the efficient-deep-learning course (**NYU SAI Lab, Spring 2026**) and cover model compression, LLM efficiency, distributed training, compilers, and hardware accelerators.
 
-**▶ Live site:** _(GitHub Pages URL added after deploy)_
+Each lecture is a self-contained HTML page with key formulas, trade-offs, tables, and an exam recap.
+
+**Live site:** _(GitHub Pages URL added after deploy)_
 
 ## Contents
 
@@ -25,7 +27,7 @@ Student revision notes for the efficient–deep-learning course (**NYU SAI Lab, 
 - `style.css` — shared stylesheet (light/dark themes)
 - `theme.js` — floating light/dark toggle
 
-Plain static HTML — open `index.html` locally, or browse the hosted GitHub Pages site. No build step.
+Plain static HTML: open `index.html` locally, run a tiny local server, or browse the hosted GitHub Pages site after deployment. No build step is needed.
 
 ## Note
 
