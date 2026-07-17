@@ -120,8 +120,8 @@ p { margin: 12px 0; }
 var { font-family: var(--serif); font-style: italic; }
 
 main p {
-  font-size: 22px;
-  line-height: 1.62;
+  font-size: 18px;
+  line-height: 1.58;
 }
 
 .wrap {
@@ -200,13 +200,13 @@ nav.toc a.sub {
   font-size: 16px;
 }
 
-header.mast { margin-bottom: 260px; }
+header.mast { margin-bottom: 150px; }
 
 .eyebrow {
   margin: 0 0 14px;
   color: var(--accent-2);
   font-family: var(--mono);
-  font-size: 20px;
+  font-size: 16px;
   letter-spacing: .22em;
   text-transform: uppercase;
 }
@@ -221,7 +221,7 @@ header.mast h1,
   text-wrap: balance;
 }
 
-header.mast h1 { font-size: 84px; }
+header.mast h1 { font-size: 58px; }
 
 header.mast .sub,
 .index-hero .sub {
@@ -231,7 +231,7 @@ header.mast .sub,
 }
 
 header.mast .sub {
-  font-size: 27px;
+  font-size: 20px;
   line-height: 1.55;
 }
 
@@ -239,11 +239,11 @@ header.mast .sub {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
-  font-size: 18px;
+  font-size: 14px;
 }
 
 .chip {
-  padding: 8px 16px;
+  padding: 6px 12px;
   border: 1px solid var(--border);
   border-radius: 999px;
   background: rgba(255, 250, 255, .66);
@@ -268,13 +268,13 @@ section {
   place-items: center;
   flex: none;
   width: 32px;
-  height: 42px;
+  height: 34px;
   border-radius: 10px;
   background: var(--accent);
   color: var(--surface);
   box-shadow: var(--shadow);
   font-family: var(--mono);
-  font-size: 20px;
+  font-size: 16px;
   font-weight: 700;
 }
 
@@ -282,7 +282,7 @@ h2 {
   margin: 0;
   color: var(--ink);
   font-family: var(--serif);
-  font-size: 42px;
+  font-size: 32px;
   font-weight: 700;
   line-height: 1.15;
   letter-spacing: 0;
@@ -292,15 +292,15 @@ h2 {
 .sec-head + .lede {
   margin: 4px 0 52px 66px;
   color: var(--ink-soft);
-  font-size: 25px;
+  font-size: 19px;
   line-height: 1.55;
 }
 
 h3 {
-  margin: 56px 0 18px;
+  margin: 42px 0 14px;
   color: var(--ink);
   font-family: var(--sans);
-  font-size: 28px;
+  font-size: 22px;
   font-weight: 650;
   letter-spacing: 0;
 }
@@ -658,7 +658,17 @@ a.lec-card .topics span {
     padding: 38px 0 24px;
   }
   .index-hero h1,
-  header.mast h1 { font-size: 38px; }
+  header.mast h1 { font-size: 34px; }
+  header.mast .sub { font-size: 17px; }
+  .eyebrow { font-size: 13px; }
+  .meta-row { font-size: 12px; }
+  .chip { padding: 5px 10px; }
+  h2 { font-size: 28px; }
+  .sec-head + .lede {
+    margin: 4px 0 28px 50px;
+    font-size: 17px;
+  }
+  main p { font-size: 16px; }
   header.mast { margin-bottom: 58px; }
 }
 
