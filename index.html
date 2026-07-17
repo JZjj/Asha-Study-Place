@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Efficient AI Systems — Study Notes</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  .grp { margin: 40px 0 16px; display: flex; align-items: baseline; gap: 12px; }
+  .grp .gl {
+    font-family: var(--mono); font-size: 12px; letter-spacing: .14em; text-transform: uppercase;
+    color: var(--accent-2);
+  }
+  .grp .gd { font-size: 13px; color: var(--muted); }
+  .grp::after { content: ""; flex: 1; height: 1px; background: var(--border); }
+  .foot { margin-top: 64px; padding-top: 22px; border-top: 1px solid var(--border); font-size: 13px; color: var(--muted); max-width: 70ch; }
+</style>
+</head>
+<body>
+<div class="index-wrap">
+  <header class="index-hero">
+    <p class="eyebrow">NYU SAI Lab · Spring 2026 · Study Notes</p>
+    <h1>Efficient AI &amp; ML Systems</h1>
+    <p class="sub">Revision notes for the efficient–deep-learning course — from model compression and LLM inference through distributed training down to the silicon. Nine lectures, each distilled into a scannable note with the key formulas, trade-offs, and an exam recap.</p>
+    <div class="meta-row">
+      <span class="chip">9 lectures</span>
+      <span class="chip">algorithms → systems → hardware</span>
+      <span class="chip">light / dark</span>
+    </div>
+  </header>
+
+  <div class="grp"><span class="gl">I · Model Compression</span><span class="gd">making a trained network smaller &amp; cheaper</span></div>
+  <div class="lec-grid">
+    <a class="lec-card" href="lecture-04.html">
+      <span class="lnum">Lecture 04</span>
+      <h3>Pruning Strategies</h3>
+      <p>Sparsity math, sparse encodings, pruning criteria, the lottery ticket, and transformer token/head pruning.</p>
+      <div class="topics"><span>MACs</span><span>N:M sparsity</span><span>lottery ticket</span><span>token/head</span></div>
+    </a>
+    <a class="lec-card" href="lecture-05.html">
+      <span class="lnum">Lecture 05</span>
+      <h3>Quantization</h3>
+      <p>INT / FP / block-float formats, symmetric vs asymmetric math, PTQ vs QAT, the straight-through estimator, PACT/QIL.</p>
+      <div class="topics"><span>INT8</span><span>scale/zero-point</span><span>QAT</span><span>STE</span></div>
+    </a>
+    <a class="lec-card" href="lecture-06.html">
+      <span class="lnum">Lecture 06</span>
+      <h3>Distillation, Low-Rank, NAS &amp; Dynamic Computing</h3>
+      <p>Knowledge distillation, neural architecture search (DARTS, ProxylessNAS, OFA), SVD factorization, conditional compute.</p>
+      <div class="topics"><span>KD</span><span>NAS</span><span>SVD</span><span>early-exit</span></div>
+    </a>
+  </div>
+
+  <div class="grp"><span class="gl">II · LLM &amp; Training Efficiency</span><span class="gd">the software side of scale</span></div>
+  <div class="lec-grid">
+    <a class="lec-card" href="lecture-07.html">
+      <span class="lnum">Lecture 07</span>
+      <h3>Efficiency Strategies for LLMs</h3>
+      <p>The KV cache, the activation-outlier problem, rotation/scaling quant (SmoothQuant, AWQ, QuaRot), Wanda, StreamingLLM.</p>
+      <div class="topics"><span>KV cache</span><span>outliers</span><span>SmoothQuant</span><span>attention sink</span></div>
+    </a>
+    <a class="lec-card" href="lecture-08.html">
+      <span class="lnum">Lecture 08</span>
+      <h3>Efficient DNN Training</h3>
+      <p>Training memory anatomy, data/parameter sampling, pruning &amp; quant during training, PEFT/LoRA, speculative decoding.</p>
+      <div class="topics"><span>activations</span><span>LoRA</span><span>BFP</span><span>spec decode</span></div>
+    </a>
+    <a class="lec-card" href="lecture-09.html">
+      <span class="lnum">Lecture 09</span>
+      <h3>Distributed Machine Learning</h3>
+      <p>Federated learning &amp; FedAvg, data parallelism (ring all-reduce), model &amp; pipeline parallelism, distributed inference.</p>
+      <div class="topics"><span>FedAvg</span><span>ring all-reduce</span><span>GPipe</span><span>early-exit</span></div>
+    </a>
+  </div>
+
+  <div class="grp"><span class="gl">III · Hardware &amp; Compilers</span><span class="gd">down to the silicon</span></div>
+  <div class="lec-grid">
+    <a class="lec-card" href="lecture-10.html">
+      <span class="lnum">Lecture 10</span>
+      <h3>AI Compiler &amp; CNN Accelerator</h3>
+      <p>The ML software stack, autograd, graph-level optimization, the energy hierarchy, im2col/GEMM, tiling, systolic arrays.</p>
+      <div class="topics"><span>graph IR</span><span>fusion</span><span>im2col</span><span>systolic</span></div>
+    </a>
+    <a class="lec-card" href="lecture-11.html">
+      <span class="lnum">Lecture 11</span>
+      <h3>Transformer &amp; LLM Accelerators</h3>
+      <p>Systolic-array dataflows, column combining, term quantization, and the classic CNN chips (DianNao, Eyeriss, Cnvlutin).</p>
+      <div class="topics"><span>weight-stationary</span><span>column combining</span><span>term-quant</span><span>Eyeriss</span></div>
+    </a>
+    <a class="lec-card" href="lecture-12.html">
+      <span class="lnum">Lecture 12</span>
+      <h3>Transformer &amp; DNN Training Accelerators</h3>
+      <p>Why training is harder for hardware, backward-pass dataflows, non-matmul units, BFP/FAST precision, reversible nets.</p>
+      <div class="topics"><span>backward pass</span><span>softmax HW</span><span>BFP</span><span>RevNet</span></div>
+    </a>
+  </div>
+
+  <p class="foot">
+    Compiled from lecture slides for <strong>NYU SAI Lab, Spring 2026</strong>. These are student revision notes summarizing the decks — refer to the original lectures and cited papers as the source of record. Use the ☾/☀ button (bottom-right) to switch light/dark.
+  </p>
+</div>
+<script src="theme.js"></script>
+</body>
+</html>

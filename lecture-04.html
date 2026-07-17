@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lecture 04: Pruning Strategies — Study Note</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+  <nav class="toc">
+    <a class="home" href="index.html">← All lectures</a>
+    <div class="brand">04 · Pruning Strategies for Efficient DNNs</div>
+    <a href="#why"><span class="n">01</span>Why prune?</a>
+    <a href="#encode"><span class="n">02</span>Sparse encodings</a>
+    <a href="#criteria"><span class="n">03</span>Pruning criteria</a>
+    <a href="#taxonomy"><span class="n">04</span>Taxonomy</a>
+    <a class="sub" href="#taxonomy">When: iterative / zero-shot</a>
+    <a class="sub" href="#taxonomy">Shape: structured / N:M</a>
+    <a class="sub" href="#taxonomy">Weight / activation</a>
+    <a class="sub" href="#taxonomy">Static / dynamic</a>
+    <a href="#transformer"><span class="n">05</span>Transformer pruning</a>
+    <a href="#recap"><span class="n">★</span>Exam recap</a>
+  </nav>
+
+  <main>
+    <header class="mast">
+      <p class="eyebrow">Lecture 04 · Study Note</p>
+      <h1>Pruning Strategies for Efficient Deep Neural Networks</h1>
+      <p class="sub">Making networks smaller and faster by zeroing out what doesn't matter — the compute &amp; storage math, how to encode sparsity, which weights to cut, and how it all changes for transformers.</p>
+      <div class="meta-row">
+        <span class="chip">NYU SAI Lab</span>
+        <span class="chip">Spring 2026</span>
+        <span class="chip">CNNs · Transformers</span>
+        <span class="chip">MACs · sparsity · rewinding</span>
+      </div>
+    </header>
+
+    <section id="why">
+      <div class="sec-head"><span class="num">01</span><h2>Why prune?</h2></div>
+      <p class="lede">Two payoffs: <strong>less compute</strong> at run time and <strong>less storage</strong> for the model. Everything downstream is a way to realize one of these.</p>
+
+      <h3>The cost of a convolution</h3>
+      <p>A conv layer maps input feature maps <var>C×H×W</var> through <var>M</var> filters of size <var>C×R×S</var> to output maps <var>M×E×F</var>. Each output pixel costs <var>R×S</var> multiply-accumulates (MACs) per input channel.</p>
+      <div class="formula"><span class="eq">MACs = <var>M</var>×<var>C</var>×<var>R</var>×<var>S</var>×<var>E</var>×<var>F</var></span><span class="lbl">compute per layer</span></div>
+      <div class="formula"><span class="eq">Storage = 32 × (<var>MCRS</var> + <var>CHW</var> + <var>MEF</var>) bits</span><span class="lbl">weights + in-act + out-act, FP32</span></div>
+      <div class="call key"><span class="k">Key distinction</span><p><strong>Weights are persistent</strong> — they must be stored for the life of the model. <strong>Activations are transient</strong> — they can be freed the moment the layer finishes. This is why weight compression dominates the storage story.</p></div>
+
+      <h3>What sparsity buys you</h3>
+      <p>If a fraction <var>p</var> of weights are zero, you simply skip those MACs. If additionally a fraction <var>q</var> of <em class="term">inputs</em> are zero, more MACs vanish — but only when a nonzero weight meets a nonzero input, hence the inequality.</p>
+      <div class="formula"><span class="eq">weight-sparse: (1−<var>p</var>) × <var>M·C·R·S·E·F</var></span><span class="lbl">exact</span></div>
+      <div class="formula"><span class="eq">+ input-sparse: ≥ (1−<var>p</var>)(1−<var>q</var>) × <var>M·C·R·S·E·F</var></span><span class="lbl">lower bound</span></div>
+      <div class="call warn"><span class="k">Offline vs online</span><p><strong>Weight pruning is offline</strong> — done once, the sparsity pattern is fixed and free at inference. <strong>Activation pruning is online</strong> — the zero pattern depends on the input, so it must be recomputed every forward pass, adding <strong>sorting / selection overhead</strong>.</p></div>
+
+      <h3>The cost of a transformer <span class="tag">per block</span></h3>
+      <p>With batch <var>B</var>, sequence length <var>L</var>, embedding <var>E</var>. The self-attention (SA) block spends most of its cost on the Q/K/V and output projections (<var>E²</var> terms) plus the two <var>L²</var> score/context matmuls:</p>
+      <div class="formula"><span class="eq">SA = 4<var>BLE</var>² + 2<var>BL</var>²<var>E</var></span><span class="lbl">4 linears + QKᵀ + ·V</span></div>
+      <div class="formula"><span class="eq">FFN = 8<var>BLE</var>²</span><span class="lbl">E→4E, 4E→E</span></div>
+      <div class="formula"><span class="eq">Block total = 12<var>BLE</var>² + 2<var>BL</var>²<var>E</var></span><span class="lbl">SA + FFN</span></div>
+      <div class="call key"><span class="k">Read the two terms</span><p>The <var>BLE²</var> term (linear projections) dominates at <strong>short sequences</strong>; the <var>BL²E</var> attention term dominates at <strong>long sequences</strong>. Pruning weights attacks the first; pruning <em class="term">tokens</em> attacks the second — which is exactly why transformers get their own pruning axis (§5).</p></div>
+      <p>Under sparsity the linear layer becomes <span style="font-family:var(--mono)">(1−<var>p</var>)·<var>BLE²</var></span> nonzero MACs, or <span style="font-family:var(--mono)">≥(1−<var>p</var>)(1−<var>q</var>)·<var>BLE²</var></span> once input activations are sparse too — the same structure as convolution.</p>
+    </section>
+
+    <hr class="rule">
+
+    <section id="encode">
+      <div class="sec-head"><span class="num">02</span><h2>Storing sparsity: encoding schemes</h2></div>
+      <p class="lede">A zeroed weight only saves memory if you don't store the zero. Each scheme trades <strong>index overhead</strong> against <strong>how much sparsity it assumes</strong>. Pick the encoding to match the sparsity level.</p>
+      <div class="call bad"><span class="k">The catch</span><p>To compress you must <strong>encode</strong> the nonzeros and their positions. For <strong>activations</strong> this encoding itself costs compute every forward pass — another reason activation sparsity is harder to exploit than weight sparsity.</p></div>
+      <div class="tbl-scroll"><table>
+        <thead><tr><th>Scheme</th><th>Idea</th><th>Storage (bits)</th><th>Best when</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Bitmap</strong></td><td>Values + one bit per position (1 = nonzero)</td><td><span class="mono">(1−p)·L·n + L</span></td><td>Low–moderate sparsity; cheap to encode</td></tr>
+          <tr><td><strong>RLE</strong><br><span style="color:var(--muted);font-size:12px">run-length</span></td><td>Values + length of the zero-run before each</td><td><span class="mono">data-dependent</span></td><td>Moderate sparsity; hard to bound analytically</td></tr>
+          <tr><td><strong>COO</strong><br><span style="color:var(--muted);font-size:12px">coordinate</span></td><td>Values + explicit (row, col) index per nonzero</td><td><span class="mono">(1−p)·L·n + (1−p)·L·⌈log₂L⌉</span></td><td>Extremely high sparsity</td></tr>
+          <tr><td><strong>CSR / CSC</strong></td><td>Values + col index + <em>cumulative</em> nonzeros per row</td><td><span class="mono">compact row ptrs</span></td><td>High sparsity; efficient row/col access</td></tr>
+        </tbody>
+      </table></div>
+      <p style="font-size:13px;color:var(--muted)"><var>n</var> = bits per value · <var>L</var> = number of elements · <var>p</var> = sparsity fraction. The <span class="mono" style="color:var(--muted)">ROW_INDEX</span> in CSR stores a running count of nonzeros, so row <var>i</var>'s entries live between positions <var>ROW_INDEX[i]</var> and <var>ROW_INDEX[i+1]</var>.</p>
+      <h3>Match the encoding to the sparsity level</h3>
+      <div class="spectrum" aria-hidden="true">
+        <div class="bar"><span style="background:#b8b8b8"></span><span style="background:var(--accent-2);opacity:.35"></span><span style="background:var(--accent-2);opacity:.55"></span><span style="background:var(--accent-2);opacity:.78"></span><span style="background:var(--accent)"></span></div>
+        <div class="labels"><div><b>0%</b>dense</div><div><b>10%</b>bitmap</div><div><b>70%</b>RLE / delta</div><div><b>90%</b>CSR / CSC</div><div><b>99.9%+</b>COO offset</div></div>
+      </div>
+      <p style="font-size:13px;color:var(--muted)">Source: Hoefler et al., <em>"Sparsity in Deep Learning,"</em> JMLR 2021.</p>
+    </section>
+
+    <hr class="rule">
+
+    <section id="criteria">
+      <div class="sec-head"><span class="num">03</span><h2>Which weights to cut? Pruning criteria</h2></div>
+      <p class="lede">Every criterion is an <strong>importance score</strong>. Cut the low-scoring weights. The schemes differ in how much they know about the loss.</p>
+      <h3>Magnitude pruning <span class="tag">simplest</span></h3>
+      <p>Keep a weight if its magnitude clears a threshold <var>a</var>, else zero it. The mask is:</p>
+      <div class="formula"><span class="eq"><var>m</var><sub>i</sub> = 1 if ‖<var>w</var><sub>i</sub>‖₁ ≥ <var>a</var> ,  else 0</span><span class="lbl">threshold mask</span></div>
+      <div class="call bad"><span class="k">Drawback</span><p>Magnitude ignores the <strong>input</strong>. A small weight that always multiplies a large, frequent activation can matter more than a large weight that rarely fires — magnitude can't see this.</p></div>
+      <h3>Training-loss change <span class="tag">Taylor / OBD</span></h3>
+      <p>Better principle: cut the weight that <strong>changes the loss least</strong>. Taylor-expand the loss around the trained weights (pruning means <var>w′</var> = 0):</p>
+      <div class="formula"><span class="eq">ℒ(0) − ℒ(<var>w</var>) = (d<var>ℒ</var>/d<var>w</var>)·<var>w</var> + ½·(d²<var>ℒ</var>/d<var>w</var>²)·<var>w</var>²</span><span class="lbl">2nd-order</span></div>
+      <ul class="clean">
+        <li><strong>First-order:</strong> sort weights by the product of gradient × value — cheap, no Hessian.</li>
+        <li><strong>For a converged net the gradient ≈ 0</strong>, so the first term vanishes and the <strong>Hessian (curvature) term drives the decision</strong> — this is <em class="term">Optimal Brain Damage</em> (LeCun et al., 1989).</li>
+        <li>The full Hessian is intractable; approximate it with the <strong>Empirical Fisher</strong> (outer product of gradients): <span class="mono">H ≈ (1/N)·Σ gᵢgᵢᵀ</span>.</li>
+      </ul>
+      <h3>Regularization-based <span class="tag">L1 / Lasso</span></h3>
+      <p>Don't prune after the fact — make training <em>prefer</em> sparse solutions by adding a penalty:</p>
+      <div class="formula"><span class="eq">min  ℒ(<var>w</var>) + λ‖<var>w</var>‖₁</span><span class="lbl">Lasso → sparse</span></div>
+      <div class="call key"><span class="k">Why L1 and not L2</span><p>The L1 ball has <strong>corners on the axes</strong>, so the optimum tends to land <em>on</em> an axis where coordinates are exactly 0. Mechanistically: the gradient of <span class="mono">|w|</span> is <span class="mono">sign(w)</span> — a constant push toward zero regardless of size — whereas <span class="mono">w²</span>'s gradient <span class="mono">2w</span> fades near zero and never quite kills the weight. L2 shrinks; <strong>L1 zeroes</strong>.</p></div>
+      <h3>The backward pass of pruning</h3>
+      <p>Pruning is a masking node in the graph. The extra factor is <span class="mono">∂W′/∂W = 0 if pruned, else 1</span>. So during backprop <strong>the gradients of pruned elements are masked out</strong> — they stay dead and don't receive updates.</p>
+    </section>
+
+    <hr class="rule">
+
+    <section id="taxonomy">
+      <div class="sec-head"><span class="num">04</span><h2>A taxonomy: five ways to slice pruning</h2></div>
+      <p class="lede">The same network can be described along five independent axes. Any real method is a point in this five-dimensional space.</p>
+      <div class="tbl-scroll"><table>
+        <thead><tr><th>Axis</th><th>Option A</th><th>Option B</th></tr></thead>
+        <tbody>
+          <tr><td><strong>When</strong></td><td>Zero-shot (train → prune)</td><td>Iterative (train ⇄ prune)</td></tr>
+          <tr><td><strong>Shape</strong></td><td>Unstructured</td><td>Structured · N:M</td></tr>
+          <tr><td><strong>What</strong></td><td>Weight pruning</td><td>Activation pruning</td></tr>
+          <tr><td><strong>Adaptivity</strong></td><td>Static (fixed pattern)</td><td>Dynamic (per-input)</td></tr>
+          <tr><td><strong>Purpose</strong></td><td>Prune for inference</td><td>Prune for training</td></tr>
+        </tbody>
+      </table></div>
+      <h3>When to prune — iterative vs zero-shot</h3>
+      <ul class="clean">
+        <li><strong>Zero-shot</strong> (a.k.a. post-training): train fully, then prune once. Fast, cheaper.</li>
+        <li><strong>Iterative</strong>: loop <em>prune a bit → retrain → repeat</em> until the target sparsity is met. <strong>Best accuracy</strong>, but multiple training rounds cost compute.</li>
+      </ul>
+      <div class="call key"><span class="k">Lottery Ticket Hypothesis · Frankle &amp; Carbin, 2018</span><p>A randomly-initialized dense net contains a <strong>sparse subnetwork</strong> ("winning ticket") that — trained in isolation <em>from the original init</em> — can match the full network's accuracy in the same number of iterations.</p></div>
+      <ul class="clean">
+        <li><strong>Iterative Magnitude Pruning (IMP)</strong> finds the ticket: train → prune <var>p%</var> → <em class="term">rewind</em> the survivors to their <span class="mono">w₀</span> values → retrain. Repeat.</li>
+        <li><strong>Weight rewinding:</strong> for larger nets, rewinding to an <em>early</em> checkpoint <span class="mono">wᵢ</span> (small <var>i</var>) beats rewinding all the way to <span class="mono">w₀</span>.</li>
+        <li><strong>Provocative takeaway</strong> (Liu et al., "Rethinking the Value of Pruning"): often it's the <strong>discovered architecture</strong> that matters, not the inherited "important" weights — pruning as a form of <em>architecture search</em>.</li>
+      </ul>
+      <h3>Shape — unstructured vs structured vs N:M</h3>
+      <div class="cards">
+        <div class="card"><p class="q">Unstructured</p><p>Any weight anywhere. Best accuracy, but irregular pattern needs special hardware to speed up.</p></div>
+        <div class="card"><p class="q">Structured</p><p>Whole vectors / kernels / filters. Hardware-friendly regular sparsity, lower accuracy.</p></div>
+        <div class="card"><p class="q">N:M</p><p>Exactly N nonzeros per M. The middle ground — 2:4 runs on NVIDIA GPUs.</p></div>
+      </div>
+      <p>Granularity runs from <strong>fine-grained (0-D)</strong> → vector (1-D) → kernel (2-D) → <strong>filter (3-D)</strong>. As you go coarser, hardware gets happier but accuracy drops — filter pruning falls off fastest.</p>
+      <div class="call good"><span class="k">Two structured tricks worth remembering</span><p><strong>Network Slimming:</strong> attach the BatchNorm <strong>scaling factor</strong> γ to each filter and put an <strong>L1 penalty</strong> on those γ's during training — unimportant filters get scaled toward zero and are removed for free.</p><p style="margin-top:10px"><strong>BatchNorm folding:</strong> at inference BN is affine, <span class="mono">Y = p·X + q</span>, so <var>p</var> folds into the conv <strong>weights</strong> and <var>q</var> into the <strong>bias</strong> — the BN layer disappears at run time.</p></div>
+      <div class="call warn"><span class="k">Cascade effect</span><p>Pruning a <strong>filter</strong> in layer <var>l</var> deletes a whole output channel → that becomes a zero <strong>input channel</strong> in layer <var>l+1</var> → which lets you drop the matching weights there too. Filter pruning propagates. (Holds when the BN bias is zero; otherwise the downstream map carries a constant.)</p></div>
+      <p><strong>N:M in hardware:</strong> a 2:4 tensor keeps 2 of every 4 weights, stores them compressed with 2-bit indices, and feeds a small MAC array that multiplexes the right inputs — regular enough to accelerate, sparse enough to help. Supported on NVIDIA V100+.</p>
+      <h3>What — weight vs activation pruning</h3>
+      <p>Activation pruning is tempting (ReLU already makes activations ~50% zero) but hard:</p>
+      <ul class="clean">
+        <li>Computing importance scores <strong>per input</strong> is expensive (it's online).</li>
+        <li>ReLU sparsity is <strong>irregular</strong> — the zero pattern shifts every sample.</li>
+        <li>Fix: impose a <strong>2:4 pattern on the ReLU output</strong>, then row-compress — regular sparsity you can actually exploit (JointNF, Zhang et al., 2024).</li>
+      </ul>
+      <h3>Adaptivity — static vs dynamic</h3>
+      <ul class="clean">
+        <li><strong>Static:</strong> one fixed pattern, components <em>permanently</em> removed.</li>
+        <li><strong>Dynamic:</strong> keep the full network but <strong>skip</strong> unimportant components per input, chosen at run time by a lightweight saliency predictor. Preserves structure, adapts to each sample.</li>
+      </ul>
+      <h3>Purpose — pruning for training</h3>
+      <p>Pruning isn't only for inference. <strong>SDGP</strong> (Structured Data Gradient Pruning) applies 2:4 sparsity to the <strong>gradient / data</strong> flowing backward (<span class="mono">dL/dO × Wᵀ</span>), speeding up training itself.</p>
+    </section>
+
+    <hr class="rule">
+
+    <section id="transformer">
+      <div class="sec-head"><span class="num">05</span><h2>Transformer-specific pruning</h2></div>
+      <p class="lede">Transformers open pruning dimensions CNNs don't have: you can drop <strong>tokens</strong> (sequence length <var>L</var>) and drop <strong>heads</strong>.</p>
+      <div class="call key"><span class="k">First, a useful fact</span><p>Splitting attention into <var>M</var> heads (each of dim <var>D = E/M</var>) <strong>does not change the total compute</strong> — <var>M</var>·<var>L</var>²·<var>D</var> = <var>L</var>²·<var>E</var>. Multi-head is a reshaping, not extra cost. So the win from head pruning is <em>removing</em> heads entirely.</p></div>
+      <h3>Token pruning <span class="tag">attacks the L² term</span></h3>
+      <p>Not every token needs to survive every layer. Score each token's importance (e.g. average attention it receives) and drop those below a threshold — <strong>progressively, layer by layer</strong>.</p>
+      <div class="formula"><span class="eq"><var>s</var><sup>(l)</sup>(<var>xᵢ</var>) = (1/<var>N<sub>h</sub></var>)(1/<var>n</var>) Σ<sub>h</sub> Σ<sub>j</sub> <var>A</var><sup>(h,l)</sup>(<var>xᵢ</var>,<var>xⱼ</var>)</span><span class="lbl">token importance</span></div>
+      <ul class="clean">
+        <li>Removed tokens <strong>cut compute for every following layer</strong> — the savings compound with depth.</li>
+        <li><strong>SpAtten</strong> (Wang et al., 2021) prunes tokens <em>and</em> heads jointly in a cascade — accumulate importance scores, keep top-k.</li>
+        <li>Intuition from sentiment example: by layer 12 only 2 tokens (<em>"best," "returning"</em>) remain and still classify correctly.</li>
+      </ul>
+      <h3>Head pruning <span class="tag">a new dimension</span></h3>
+      <p>Reshape input <span class="mono">(1, 197, 768)</span> → <span class="mono">(1, 12, 197, 64)</span> and simply keep fewer heads → <span class="mono">(1, 4, 197, 64)</span>. Which heads to cut? Attach a mask variable <var>ξ<sub>h</sub></var> ∈ {0,1} to each head and score by loss sensitivity:</p>
+      <div class="formula"><span class="eq"><var>I<sub>h</sub></var> = 𝔼<sub>x∼X</sub> |∂ℒ(<var>x</var>)/∂<var>ξ<sub>h</sub></var>|</span><span class="lbl">head importance</span></div>
+      <div class="call good"><span class="k">Surprising result · Michel et al., "Are 16 Heads Really Better Than One?"</span><p>Most attention heads can be removed with little accuracy loss — <strong>a few specialized heads do the heavy lifting</strong>. In some cases removing a head actually <em>raises</em> BLEU/accuracy.</p></div>
+    </section>
+
+    <hr class="rule">
+
+    <section id="recap">
+      <div class="sec-head"><span class="num">★</span><h2>Exam recap</h2></div>
+      <div class="cards">
+        <div class="card"><p class="q">Two goals</p><p>Reduce <strong>compute</strong> (skip MACs) and reduce <strong>storage</strong> (don't store zeros). Weights persist; activations are transient.</p></div>
+        <div class="card"><p class="q">Sparsity math</p><p>Weight-sparse = (1−p)·MACs (exact). +Input-sparse ≥ (1−p)(1−q)·MACs.</p></div>
+        <div class="card"><p class="q">Transformer cost</p><p>Block = 12BLE² + 2BL²E. Linears scale E², attention scales L².</p></div>
+        <div class="card"><p class="q">Encodings</p><p>Bitmap (low) → RLE → CSR (high) → COO (extreme). Match to sparsity level.</p></div>
+        <div class="card"><p class="q">Criteria</p><p>Magnitude (ignores input) → Taylor/OBD (Hessian; grad≈0 when trained) → L1/Lasso (zeroes, not shrinks).</p></div>
+        <div class="card"><p class="q">Lottery Ticket</p><p>Sparse subnet + right init matches dense. Find it with IMP + weight rewinding.</p></div>
+        <div class="card"><p class="q">Structured trade</p><p>Unstructured = accuracy; structured = hardware. N:M (2:4) is the GPU-supported middle.</p></div>
+        <div class="card"><p class="q">Transformer extras</p><p>Prune tokens (cuts L², compounds with depth) and heads (most are redundant).</p></div>
+      </div>
+    </section>
+
+    <footer>
+      Study note compiled from <em>Lecture 04 — Pruning Strategies for Efficient Deep Neural Network</em>, NYU SAI Lab, Spring 2026. Key references: LeCun 1989 · Frankle &amp; Carbin 2018 · Liu 2017/2018 · Michel 2019 · Wang (SpAtten) 2021 · Hoefler 2021 · Kim 2022 · Zhang 2024.
+    </footer>
+  </main>
+</div>
+<script src="theme.js"></script>
+</body>
+</html>

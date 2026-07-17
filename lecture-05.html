@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lecture 05: Quantization — Study Note</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+  <nav class="toc">
+    <a class="home" href="index.html">← All lectures</a>
+    <div class="brand">05 · Quantization Strategies for Efficient DNNs</div>
+    <a href="#why"><span class="n">01</span>Why quantize &amp; formats</a>
+    <a href="#int"><span class="n">02</span>Fixed-point (INT)</a>
+    <a class="sub" href="#int">Symmetric / asymmetric math</a>
+    <a class="sub" href="#int">Computation &amp; granularity</a>
+    <a class="sub" href="#int">Binary · ternary · log</a>
+    <a href="#float"><span class="n">03</span>Floating &amp; block-float</a>
+    <a href="#taxonomy"><span class="n">04</span>Taxonomy</a>
+    <a class="sub" href="#taxonomy">Weight / activation</a>
+    <a class="sub" href="#taxonomy">PTQ vs QAT</a>
+    <a class="sub" href="#taxonomy">Deterministic / stochastic</a>
+    <a href="#qat"><span class="n">05</span>QAT internals &amp; STE</a>
+    <a href="#learnable"><span class="n">06</span>Learnable quantization</a>
+    <a href="#recap"><span class="n">★</span>Exam recap</a>
+  </nav>
+
+  <main>
+    <header class="mast">
+      <p class="eyebrow">Lecture 05 · Study Note</p>
+      <h1>Quantization Strategies for Efficient DNN Implementation</h1>
+      <p class="sub">Trading precision for memory, compute, and energy — the number formats (INT / FP / BFP), the exact scale–zero-point math, where quantization error hides, and how to make the clipping range and rounding <em>learnable</em>.</p>
+      <div class="meta-row">
+        <span class="chip">NYU SAI Lab</span>
+        <span class="chip">Spring 2026</span>
+        <span class="chip">INT · FP · BFP</span>
+        <span class="chip">PTQ · QAT · STE</span>
+        <span class="chip">PACT · QIL · QN</span>
+      </div>
+    </header>
+
+    <section id="why">
+      <div class="sec-head"><span class="num">01</span><h2>Why quantize, and the format landscape</h2></div>
+      <p class="lede">Quantization replaces high-precision numbers (FP32) with a smaller set of low-precision values. Like pruning, the payoff is <strong>less storage</strong> and <strong>less compute / energy</strong> — but here we shrink each number instead of removing it.</p>
+
+      <h3>Three families of data format</h3>
+      <p>The lecture organizes everything around three basic representations, then two families of quantization <em class="term">method</em> built on top of them.</p>
+      <div class="tbl-scroll"><table>
+        <thead><tr><th>Format</th><th>Idea</th><th>Precision behaviour</th><th>Compute</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Fixed-point (INT)</strong></td><td>Uniform grid: one scale <var>s</var> maps integers to reals</td><td><strong>Uniform</strong> — every step is the same size</td><td>Cheap integer adders / multipliers</td></tr>
+          <tr><td><strong>Floating-point (FP)</strong></td><td>Sign · exponent · mantissa (IEEE-754)</td><td><strong>Relative</strong> — fine near 0, coarse when large</td><td>Align/normalize; add is expensive</td></tr>
+          <tr><td><strong>Block floating point (BFP)</strong></td><td>A group of values <em>shares one exponent</em>, keeps individual mantissas</td><td>Middle ground between INT and FP</td><td>Inner-group = fixed-point; cross-group = FP</td></tr>
+        </tbody>
+      </table></div>
+      <div class="call key"><span class="k">INT vs FP — the one-line intuition</span><p><strong>FP gives relative precision:</strong> under a fixed exponent the mantissa fills the gap evenly, but as the exponent grows the step size grows <em>exponentially</em> — small magnitudes get fine granularity, large magnitudes get coarse. <strong>INT gives uniform precision:</strong> every representable value is exactly the same distance <var>s</var> apart. Weights cluster near zero, so both stories matter.</p></div>
+    </section>
+
+    <hr class="rule">
+
+    <section id="int">
+      <div class="sec-head"><span class="num">02</span><h2>Fixed-point (INT) quantization</h2></div>
+      <p class="lede">Quantizing with a fixed-point format is called <em class="term">INT quantization</em>. Two hyperparameters define it: the <strong>clipping range</strong> (often symmetric <span class="mono">(−L, L)</span>) and the <strong>bitwidth</strong> <var>b</var>. Everything downstream is arithmetic on the integer code <var>x</var><sub>int</sub>.</p>
+
+      <h3>Symmetric quantization <span class="tag">round-trip</span></h3>
+      <p>To convert a real number <var>x</var> to its INT representation and back:</p>
+      <div class="formula"><span class="eq"><var>s</var> = 2<var>L</var> / (2<sup><var>b</var></sup> − 2)</span><span class="lbl">scale (step size)</span></div>
+      <div class="formula"><span class="eq"><var>x</var><sub>c</sub> = Clip(<var>x</var>, <var>L</var>, −<var>L</var>)</span><span class="lbl">clip into [−L, L]</span></div>
+      <div class="formula"><span class="eq"><var>x</var><sub>int</sub> = round(<var>x</var><sub>c</sub> / <var>s</var>)</span><span class="lbl">integer code</span></div>
+      <div class="formula"><span class="eq"><var>x</var><sub>q</sub> = <var>s</var> · <var>x</var><sub>int</sub></span><span class="lbl">rescale (dequantize)</span></div>
+      <div class="call key"><span class="k">Why 2<sup>b</sup> − 2 and not 2<sup>b</sup> − 1</span><p>With <var>s</var> = 2<var>L</var>/(2<sup><var>b</var></sup>−2) the grid is symmetric <em>and</em> <strong>zero is exactly representable</strong> — important because zeros appear constantly (padding, ReLU, pruned weights). Using 2<sup><var>b</var></sup>−1 gives one more level but no exact zero. The representation power is <strong>uniform inside the clipping range</strong>, and all computation runs on <var>x</var><sub>int</sub>.</p></div>
+
+      <h3>Worked example</h3>
+      <p><span class="mono">X = [1.1, 2.4, −0.3, 0.8]</span>, bitwidth <var>b</var> = 3, <var>L</var> = 2.</p>
+      <ul class="clean">
+        <li>Scale: <span class="mono">s = 4 / (2³−2) = 4/6 = 2/3</span></li>
+        <li>Clip: <span class="mono">x_c = [1.1, 2, −0.3, 0.8]</span> (the 2.4 is clamped to L = 2)</li>
+        <li>Integer code: <span class="mono">x_int = round(x_c / s) = [2, 3, 0, 1]</span></li>
+        <li>Dequantize: <span class="mono">x_q = s·x_int = [1.33, 2.0, 0.0, 0.67]</span></li>
+      </ul>
+      <p>The gap between <span class="mono">x_q</span> and the original <span class="mono">X</span> is the <strong>quantization error</strong>; clamping 2.4 → 2.0 is <strong>truncation (clipping) error</strong>.</p>
+
+      <h3>Asymmetric (unsymmetrical) quantization <span class="tag">INT8-style</span></h3>
+      <p>When the range isn't centred on zero, use an explicit <span class="mono">(L<sub>min</sub>, L<sub>max</sub>)</span> and add an offset (a zero-point) back at the end:</p>
+      <div class="formula"><span class="eq"><var>s</var> = (<var>L</var><sub>max</sub> − <var>L</var><sub>min</sub>) / (2<sup><var>b</var></sup> − 1)</span><span class="lbl">scale</span></div>
+      <div class="formula"><span class="eq"><var>x</var><sub>int</sub> = round((<var>x</var><sub>c</sub> − <var>L</var><sub>min</sub>) / <var>s</var>)</span><span class="lbl">shift, then round</span></div>
+      <div class="formula"><span class="eq"><var>x</var><sub>q</sub> = <var>s</var> · <var>x</var><sub>int</sub> + <var>L</var><sub>min</sub></span><span class="lbl">rescale + offset</span></div>
+      <p>Example with the same <span class="mono">X</span>, <var>b</var> = 3, <span class="mono">L<sub>max</sub> = 2, L<sub>min</sub> = −0.5</span>: <span class="mono">s = 2.5/7 = 0.357</span>, <span class="mono">x_int = [4, 7, 1, 4]</span>, <span class="mono">x_q = [0.93, 2.0, −0.14, 0.93]</span>. The asymmetric range packs the grid tighter around the data, but the offset <span class="mono">L<sub>min</sub></span> reappears in every arithmetic rule.</p>
+
+      <h3>Computing on quantized values</h3>
+      <p>The whole point of INT is that math can stay in integers. What survives depends on whether the two operands share a scale.</p>
+      <div class="tbl-scroll"><table>
+        <thead><tr><th>Op</th><th>Same scale <var>s</var> (symmetric)</th><th>Different scales <var>s</var><sub>x</sub>, <var>s</var><sub>y</sub></th></tr></thead>
+        <tbody>
+          <tr><td><strong>Add / Sub</strong></td><td><span class="mono">s(x_int ± y_int)</span></td><td>Hard to compute (scales don't factor out)</td></tr>
+          <tr><td><strong>Multiply</strong></td><td><span class="mono">s²(x_int × y_int)</span></td><td><span class="mono">s_x s_y (x_int × y_int)</span></td></tr>
+          <tr><td><strong>Divide</strong></td><td><span class="mono">x_int / y_int</span></td><td><span class="mono">(s_x/s_y)(x_int / y_int)</span></td></tr>
+        </tbody>
+      </table></div>
+      <p>For the <strong>asymmetric</strong> case the offset makes even addition messy, and multiplication grows cross terms:</p>
+      <div class="formula"><span class="eq"><var>x</var><sub>q</sub> + <var>y</var><sub>q</sub> = <var>s</var>(<var>x</var><sub>int</sub> + <var>y</var><sub>int</sub>) + 2<var>L</var><sub>min</sub></span><span class="lbl">add (subtraction drops the offset)</span></div>
+      <div class="formula"><span class="eq"><var>x</var><sub>q</sub>·<var>y</var><sub>q</sub> = <var>s</var><sub>x</sub><var>s</var><sub>y</sub>(<var>x</var><sub>int</sub>·<var>y</var><sub>int</sub>) + <var>L</var><sub>min,x</sub><var>y</var><sub>q</sub><var>s</var><sub>y</sub> + <var>L</var><sub>min,y</sub><var>x</var><sub>q</sub><var>s</var><sub>x</sub> + <var>L</var><sub>min,x</sub><var>L</var><sub>min,y</sub></span><span class="lbl">multiply — extra terms</span></div>
+      <div class="call warn"><span class="k">Design consequence</span><p>Symmetric quantization keeps the hardware simple (one scale factors out cleanly). Asymmetric fits skewed distributions better but drags an extra offset through every operation, and <strong>division is essentially impractical</strong> to implement. This is why most weight quantization is symmetric.</p></div>
+
+      <h3>Dot products and the INT-MAC pipeline</h3>
+      <p>For a dot product, <strong>all elements within a tensor share one scale, but the scale can differ across tensors</strong>. The shared scale pulls straight out of the sum:</p>
+      <div class="formula"><span class="eq"><var>x</var><sub>q,1</sub><var>y</var><sub>q,1</sub> + <var>x</var><sub>q,2</sub><var>y</var><sub>q,2</sub> = <var>s</var><sub>x</sub><var>s</var><sub>y</sub>(<var>x</var><sub>int,1</sub><var>y</var><sub>int,1</sub> + <var>x</var><sub>int,2</sub><var>y</var><sub>int,2</sub>)</span><span class="lbl">quantized dot product</span></div>
+      <p>So an INT layer is a three-stage pipeline — <span class="mono">quantize → INT MAC → dequantize</span> — versus a single <span class="mono">FP MAC</span> in full precision. The middle stage runs on cheap integer hardware; the outer stages are the tax you pay for it.</p>
+
+      <h3>Granularity: per-tensor vs per-row vs per-column</h3>
+      <p>INT can be applied to a whole tensor or to smaller blocks, each with its own scale.</p>
+      <div class="cards">
+        <div class="card"><p class="q">Per-tensor</p><p>One scale for everything. Cheapest, coarsest — a single outlier stretches the range for all values.</p></div>
+        <div class="card"><p class="q">Row-wise</p><p>A scale per row. In the slide's example this gives <strong>low error</strong> — rows are more homogeneous.</p></div>
+        <div class="card"><p class="q">Column-wise</p><p>A scale per column. Here it gives <strong>high error</strong> — the grouping doesn't match the data's structure.</p></div>
+      </div>
+      <div class="call bad"><span class="k">The catch</span><p>A higher (finer) quantization granularity lowers error but <strong>incurs conversion overhead</strong> — more scales to store, compute, and apply. Granularity is the error-vs-overhead knob, and which axis (row vs column) wins depends entirely on how the data is laid out.</p></div>
+
+      <h3>Extreme low bits: binary, ternary, and logarithmic</h3>
+      <ul class="clean">
+        <li><strong>Binary</strong> quantization maps weights to <span class="mono">{−1, +1}</span>; <strong>ternary</strong> to <span class="mono">{−1, 0, +1}</span>.</li>
+        <li>Both give <strong>multiplication-free DNNs</strong> — a multiply by ±1 is just a sign flip, so the expensive multiplier disappears.</li>
+        <li><strong>Logarithmic arithmetic</strong> is a specialized INT scheme using only <strong>power-of-two</strong> values. Each number is stored as its exponent = <span class="mono">log(INT)</span>; 8 distinct values need only 3 bits, and multiplication becomes <strong>bit-shifting / adding exponents</strong> (<span class="mono">a×2 = a≪1</span>). Cheap and cost-effective in hardware.</li>
+      </ul>
+    </section>
+
+    <hr class="rule">
+
+    <section id="float">
+      <div class="sec-head"><span class="num">03</span><h2>Floating-point &amp; block floating point</h2></div>
+      <p class="lede">FP trades the uniform INT grid for a sign / exponent / mantissa layout that gives finer resolution near zero — at the cost of expensive addition. BFP sits between the two.</p>
+
+      <h3>IEEE-754 floating point</h3>
+      <p>An FP number has three fields — sign <var>s</var>, exponent <var>e</var>, mantissa <var>m</var>:</p>
+      <div class="formula"><span class="eq"><var>x</var> = (−1)<sup><var>s</var></sup> × 2<sup><var>e</var>−bias</sup> × (1 + <var>m</var>)</span><span class="lbl">m = (0.b₀b₁…b₂₂)₂</span></div>
+      <ul class="clean">
+        <li><strong>FP32</strong>: 1 sign · 8 exponent · 23 mantissa, <strong>bias = 127</strong>.</li>
+        <li><strong>FP16</strong>: 1 sign · 5 exponent · 10 mantissa.</li>
+        <li>The exponent field is <strong>unsigned</strong> (hence the bias); an all-zero bit stream is the special case for <span class="mono">0</span>.</li>
+      </ul>
+      <p>To encode a real number: <span class="mono">x = |x|</span>, <span class="mono">s = sign(x)</span>, <span class="mono">a = ⌊log₂ x⌋</span>, <span class="mono">e = a + bias</span>, <span class="mono">m = x/2ᵃ − 1</span>. For example <span class="mono">x = −13.24, bias = 127</span> → <span class="mono">a = 3, e = 130, m = 0.655</span>, i.e. <span class="mono">s = 1, e = (10000010)₂</span>. And <span class="mono">5.5 = (−1)⁰ × 2^(129−127) × (1.011)₂</span>.</p>
+
+      <div class="call key"><span class="k">Where FP's precision goes</span><p>In the formula, the <strong>2<sup>e−bias</sup></strong> factor sets the scale and the <strong>(1+m)</strong> factor fills the interval evenly. So for a fixed exponent the mantissa spreads points uniformly, but each time the exponent ticks up the whole interval doubles — <strong>granularity decreases exponentially with magnitude</strong>. That's why FP has "better representation power for small magnitudes."</p></div>
+
+      <h3>Computing with FP <span class="tag">add is the hard one</span></h3>
+      <ul class="clean">
+        <li><strong>Add / Sub:</strong> you must first <em>align the exponents</em> (shift one mantissa), then add — an extra alignment step every time.</li>
+        <li><strong>Multiply:</strong> simpler — <strong>sum the exponents, multiply the mantissas</strong>: <span class="mono">e = e₁ + e₂</span>, <span class="mono">1+m = normalizer(1.m₁ × 1.m₂)</span>.</li>
+        <li><strong>Takeaway:</strong> addition/subtraction is <em>expensive</em> for FP (alignment + normalization), the opposite of INT where addition is trivial.</li>
+      </ul>
+
+      <h3>Customized FP formats for DNNs</h3>
+      <p>Many narrow FP formats trade exponent bits (dynamic range) against mantissa bits (precision):</p>
+      <div class="tbl-scroll"><table>
+        <thead><tr><th>Format</th><th>Exponent</th><th>Mantissa</th><th>Note</th></tr></thead>
+        <tbody>
+          <tr><td><strong>FP32</strong></td><td>8</td><td>23</td><td>IEEE-754 baseline</td></tr>
+          <tr><td><strong>FP16</strong></td><td>5</td><td>10</td><td>IEEE-754 half</td></tr>
+          <tr><td><strong>bfloat16</strong></td><td>8</td><td>7</td><td>Keeps FP32's range, sheds mantissa</td></tr>
+          <tr><td><strong>TensorFloat (TF32)</strong></td><td>8</td><td>10</td><td>FP32 range + FP16-ish precision</td></tr>
+          <tr><td><strong>HFP8</strong></td><td>4 or 5</td><td>3 or 2</td><td>8-bit float, two variants</td></tr>
+          <tr><td><strong>NVFP4</strong></td><td>2</td><td>1</td><td>4-bit float, extreme low precision</td></tr>
+        </tbody>
+      </table></div>
+      <p>Like INT, FP can also be applied to a <strong>block</strong> of numbers with a customizable block size — which leads directly to BFP.</p>
+
+      <h3>Block floating point (BFP)</h3>
+      <p>BFP applies a <strong>shared exponent to a group of fixed-point values</strong>, balancing precision and dynamic range while cutting the cost of full FP. A group of size <var>g</var> keeps one group exponent (with a bias shared across groups) plus per-element sign + mantissa.</p>
+      <div class="formula"><span class="eq">FP:  <var>x</var> = (−1)<sup><var>s</var></sup> × 2<sup><var>e</var>−bias</sup> × (1 + <var>m</var>)</span><span class="lbl">has a leading 1</span></div>
+      <div class="formula"><span class="eq">BFP: <var>x</var> = (−1)<sup><var>s</var></sup> × 2<sup><var>e</var>−bias</sup> × <var>m</var></span><span class="lbl">m = (b₀.b₁b₂…)₂ — no leading 1</span></div>
+      <ul class="clean">
+        <li><strong>Inner-group</strong> operations run as <strong>fixed-point</strong> arithmetic (shared exponent → integers).</li>
+        <li><strong>Cross-group</strong> operations run as <strong>floating-point</strong> (different exponents must be reconciled).</li>
+        <li>Encoding a block: <em>find the max value → set the group exponent → shift all significands to that exponent → store sign + mantissa</em>. Example: <span class="mono">{5.5, 2.625, −3.125, 2.75}</span> → max 5.5 → group exponent 2 → each value re-expressed as <span class="mono">(−1)ˢ×2²×(0.…)₂</span>.</li>
+      </ul>
+      <div class="call good"><span class="k">Why BFP is attractive</span><p>One exponent amortized over a whole block means <strong>near-FP dynamic range at near-INT compute cost</strong>. Formats like <strong>MSFP-12</strong> (e.g. <var>g</var>=16, <var>e</var>=8, <var>m</var>=3) are exactly this middle ground — the reason BFP shows up in modern accelerators.</p></div>
+    </section>
+
+    <hr class="rule">
+
+    <section id="taxonomy">
+      <div class="sec-head"><span class="num">04</span><h2>A taxonomy of quantization methods</h2></div>
+      <p class="lede">Quantization techniques can be classified along five independent perspectives. A real method is a point in this space.</p>
+      <div class="tbl-scroll"><table>
+        <thead><tr><th>Axis</th><th>Option A</th><th>Option B (and C)</th></tr></thead>
+        <tbody>
+          <tr><td><strong>What</strong></td><td>Weight quantization</td><td>Activation quantization</td></tr>
+          <tr><td><strong>When</strong></td><td>Post-training quantization (PTQ)</td><td>Quantization-aware training (QAT)</td></tr>
+          <tr><td><strong>Granularity</strong></td><td>Tensor-based</td><td>Vector-based · Group-based</td></tr>
+          <tr><td><strong>Purpose</strong></td><td>Quantize for inference</td><td>Quantize for training</td></tr>
+          <tr><td><strong>Rule</strong></td><td>Deterministic</td><td>Stochastic</td></tr>
+        </tbody>
+      </table></div>
+
+      <h3>Weight quantization — the clip range matters most</h3>
+      <p>Weights follow a <strong>Gaussian-like distribution</strong>. Outliers in the tail blow up the quantization error, so choosing the clip range <var>L</var> is critical:</p>
+      <ul class="clean">
+        <li><strong>Small <var>L</var>:</strong> large truncation error (many values clipped) but <strong>low error for small values</strong> (grid is dense near zero).</li>
+        <li><strong>Large <var>L</var>:</strong> small truncation error but <strong>large error for small values</strong> (grid is spread thin, and most weights are small).</li>
+        <li>Common heuristics: <span class="mono">L = 0.9 × max(|W|)</span> or <span class="mono">L = 0.95 × max(|W|)</span> — the constants are <em>chosen by experience</em> (and §6 asks: can we learn them instead?).</li>
+      </ul>
+
+      <h3>Activation quantization — the dynamic tax</h3>
+      <p>Activations depend on the input, so their quantization must be done <strong>dynamically</strong>, adding compute overhead. They also pass through nonlinear functions (BatchNorm, ReLU) that are sensitive to quantization error, so a layer <strong>dequantizes back to FP16/32</strong> around them: <span class="mono">FP2INT → INT Conv → INT2FP → BatchNorm → ReLU → FP2INT → …</span></p>
+      <div class="call bad"><span class="k">Low precision can cost more than it saves</span><p>On a 4090 GPU a 577×1024 · 1024×1024 projection layer measured (ms): <strong>FP32 = 0.078, FP16 = 0.052, FP8 = 0.187, FP8 w/o scale = 0.132, INT4 = 0.136</strong>. The low-precision paths are <em>slower</em> because the quantize/dequantize machinery dominates — roughly <strong>Cal_scale 27% · Quant 26% · MatMul 25% · Dequantize 22%</strong>. For low-precision, the conversion overhead can exceed the MAC savings.</p></div>
+
+      <h3>Deterministic vs stochastic quantization</h3>
+      <p>Consider <span class="mono">a = 0.2</span> on a <span class="mono">{0, 1}</span> grid. Deterministic rounding gives <span class="mono">q(a) = 0</span> every time — a systematic <strong>bias</strong>. Stochastic quantization instead rounds probabilistically:</p>
+      <div class="formula"><span class="eq"><var>q</var>(<var>a</var>) = 1 with p = 0.2,  0 with p = 0.8</span><span class="lbl">unbiased in expectation</span></div>
+      <ul class="clean">
+        <li>In expectation <span class="mono">E[q(a)] = 0.2 = a</span> — the bias vanishes on average.</li>
+        <li>For QAT the deterministic bias isn't fatal because <strong>BatchNorm's own bias absorbs it</strong>.</li>
+        <li>Stochastic quantization is <strong>especially useful for accelerating DNN training</strong>, where unbiased gradients matter.</li>
+      </ul>
+
+      <h3>Clustering-based quantization <span class="tag">non-uniform</span></h3>
+      <p>Quantization and clustering are cousins: clustering assigns each value to a <strong>centroid</strong>; quantization maps each value to a predefined <strong>level</strong>. K-means-style clustering picks centroids freely (non-uniform levels).</p>
+      <div class="call warn"><span class="k">Trade-off</span><p>Clustering compresses the weight matrix well and stores efficiently (indices + a small codebook), and its <strong>flexible centroids usually give better accuracy</strong> — but the irregular levels are <strong>hard to accelerate for computation</strong>. Good for storage, awkward for MACs.</p></div>
+    </section>
+
+    <hr class="rule">
+
+    <section id="qat">
+      <div class="sec-head"><span class="num">05</span><h2>QAT internals: STE &amp; quantized-gradient training</h2></div>
+      <p class="lede">PTQ is cheap but lossy; QAT bakes quantization into training for higher accuracy. Its central problem: the quantizer is a staircase whose derivative is zero almost everywhere — so how does the gradient get through?</p>
+
+      <h3>PTQ vs QAT</h3>
+      <div class="cards">
+        <div class="card"><p class="q">PTQ</p><p>Train in full precision, then quantize the weights once. Lower computational cost, lower accuracy.</p></div>
+        <div class="card"><p class="q">QAT</p><p>Quantize weights/activations, train, repeat until convergence. Higher accuracy, higher cost.</p></div>
+      </div>
+      <div class="call key"><span class="k">When to use which</span><p>For models that are <strong>expensive to train (LLMs)</strong>, retraining under QAT is infeasible, so <strong>PTQ is the default</strong> — you accept a bit of accuracy loss to avoid another training run.</p></div>
+
+      <h3>The backward-pass problem</h3>
+      <p>Insert a quantizer <span class="mono">Q</span> so <span class="mono">W → Q → W′</span>, then <span class="mono">Y = W′A, Z = ReLU(Y)</span>. Backprop needs the full chain:</p>
+      <div class="formula"><span class="eq">∂ℒ/∂<var>W</var> = (∂ℒ/∂<var>Z</var>)(∂<var>Z</var>/∂<var>Y</var>)(∂<var>Y</var>/∂<var>W′</var>)(∂<var>W′</var>/∂<var>W</var>)</span><span class="lbl">the troublesome factor is ∂W′/∂W</span></div>
+      <p>Since <span class="mono">W′ = Q(W)</span> is a staircase, <span class="mono">∂W′/∂W = 0</span> almost everywhere — the gradient dies and the network becomes <strong>untrainable</strong>.</p>
+
+      <h3>Straight-Through Estimator (STE)</h3>
+      <p>STE simply <strong>pretends the quantizer is the identity on the backward pass</strong>:</p>
+      <div class="formula"><span class="eq">∂<var>W′</var>/∂<var>W</var> = 1</span><span class="lbl">Straight-Through Estimator</span></div>
+      <div class="call good"><span class="k">The rule in one sentence</span><p><strong>Forward pass: apply quantization. Backward pass: ignore it.</strong> The forward pass sees the quantized weights (so the network learns to cope with quantization), while gradients flow through as if the quantizer weren't there. (Li, Hao et al., 2017.)</p></div>
+      <p>STE is the crudest estimator of the sign/staircase gradient. Smoother surrogates keep more signal — <strong>Bi-Real Net</strong> (Liu et al., 2020) replaces the hard <span class="mono">Sign(x)</span> with <span class="mono">Clip(−1, x, 1)</span>, <span class="mono">ApproxSign</span>, or a <span class="mono">3-order-ApproxSign</span>, each giving a non-zero, better-shaped derivative near the step.</p>
+
+      <h3>PyTorch shape of a quantized layer</h3>
+      <p>A quantized conv layer just wraps the weight in a quantizer <span class="mono">Q</span> before the matmul:</p>
+      <ul class="clean">
+        <li><span class="mono">L = 0.9 * w.abs().max()</span> — pick the clip range from the weights.</li>
+        <li><span class="mono">w = torch.clip(w, -L, L)</span> — clamp.</li>
+        <li><span class="mono">scale = 2L / (2**b − 2)</span> — the symmetric scale.</li>
+        <li><span class="mono">wq = (w/scale).round() * scale</span> — quantize then dequantize; STE handles the <span class="mono">.round()</span> gradient.</li>
+      </ul>
+
+      <h3>Quantizing during training — mind the gradients</h3>
+      <p>Training has three matmuls, not one: forward <span class="mono">Y = WA</span>, data-gradient <span class="mono">∇X = ∇Y · Wᵀ</span>, and weight-gradient <span class="mono">∇W = Xᵀ · ∇Y</span>. To accelerate training you quantize the operands of <em>all three</em> with <span class="mono">Q(·)</span> (or a stochastic <span class="mono">SQ(·)</span>).</p>
+      <div class="call bad"><span class="k">Gradients resist quantization</span><p>The <strong>gradient is much more sensitive to quantization error</strong> than weights or activations. DNN gradients are <strong>near-lognormal</strong> (Chmiel et al., 2020) — a huge dynamic range concentrated near zero with a long tail — which is exactly the distribution a uniform INT grid handles worst. This is why stochastic quantization and careful formats are needed for training-time quantization.</p></div>
+    </section>
+
+    <hr class="rule">
+
+    <section id="learnable">
+      <div class="sec-head"><span class="num">06</span><h2>Learnable &amp; adaptive quantization</h2></div>
+      <p class="lede">The clip range <var>L</var> was picked by a hand-tuned constant (0.9, 0.95). Learnable quantization makes the quantization hyperparameters — the range, the rounding, even the whole mapping — <strong>trainable via gradient descent</strong>.</p>
+
+      <h3>PACT — learn the clipping range</h3>
+      <p><strong>PACT</strong> (Choi et al., 2018) makes the clip level <var>l</var> a learnable parameter. Clip, then quantize:</p>
+      <div class="formula"><span class="eq">Clip(<var>x</var>, <var>l</var>) = <var>l</var> if <var>x</var> ≥ <var>l</var>;  <var>x</var> if −<var>l</var> ≤ <var>x</var> ≤ <var>l</var>;  −<var>l</var> if <var>x</var> ≤ −<var>l</var></span><span class="lbl">parameterized clip</span></div>
+      <div class="formula"><span class="eq">∂ℒ/∂<var>l</var> = (∂ℒ/∂<var>x</var><sub>q</sub>)(∂<var>x</var><sub>q</sub>/∂<var>x</var><sub>c</sub>)(∂<var>x</var><sub>c</sub>/∂<var>l</var>) ≈ (∂ℒ/∂<var>x</var><sub>q</sub>)(∂<var>x</var><sub>c</sub>/∂<var>l</var>)</span><span class="lbl">STE drops ∂x_q/∂x_c ≈ 1</span></div>
+      <p>The gradient of the clip w.r.t. <var>l</var> is <strong>1 where the input is saturated</strong> (<span class="mono">|x| ≥ l</span>) and <strong>0 in the pass-through region</strong> — so <var>l</var> only feels pressure from the clipped tail, letting the network learn how tight to squeeze the range.</p>
+
+      <h3>QIL — Quantization Interval Learning</h3>
+      <p><strong>QIL</strong> (Jung et al., 2019) learns an <em>asymmetric interval</em> <span class="mono">(c−L, c+L)</span> and adds rounding flexibility by inserting a learnable transform <span class="mono">F</span> before quantization:</p>
+      <div class="formula"><span class="eq"><var>w</var><sub>q</sub> = Q(<var>w</var>)  →  <var>w</var><sub>q</sub> = Q(F(<var>w</var>))</span><span class="lbl">transform, then quantize</span></div>
+      <div class="formula"><span class="eq">ŵ = 0 if |<var>w</var>| &lt; <var>c</var><sub>W</sub>−<var>d</var><sub>W</sub>;  sign(<var>w</var>) if |<var>w</var>| &gt; <var>c</var><sub>W</sub>+<var>d</var><sub>W</sub>;  (α<sub>W</sub>|<var>w</var>|+β<sub>W</sub>)<sup>γ</sup>·sign(<var>w</var>) otherwise</span><span class="lbl">learnable mapping F</span></div>
+      <ul class="clean">
+        <li>The <span class="mono">γ</span> exponent bends the mapping: <span class="mono">γ = 1</span> is linear, <span class="mono">γ &lt; 1</span> and <span class="mono">γ &gt; 1</span> curve it — giving control over <em>which</em> FP weight rounds to <em>which</em> level (e.g. <span class="mono">w = 0.2</span> can be mapped to <span class="mono">ŵ = 0.8</span> before rounding).</li>
+        <li><span class="mono">w_q = Q(F(w))</span> is precomputed and stored for inference after training.</li>
+        <li>QIL is applied to <strong>weights</strong>, not activations — the mapping is too much computational overhead to run dynamically on activations.</li>
+      </ul>
+
+      <h3>Quantization Networks (QN) — quantization as a differentiable function</h3>
+      <p><strong>QN</strong> (Yang et al., 2019) reframes low-bit quantization as a <strong>differentiable non-linear function</strong> — a sum of soft step functions:</p>
+      <div class="formula"><span class="eq"><var>y</var> = α( Σ<sub>i=1..n</sub> <var>s</var><sub>i</sub> 𝒜(β<var>x</var> − <var>b</var><sub>i</sub>) − <var>o</var> ),   𝒜(<var>x</var>) = 1 if <var>x</var> ≥ 0 else 0</span><span class="lbl">n+1 quantization intervals</span></div>
+      <ul class="clean">
+        <li><span class="mono">n + 1</span> = number of quantization intervals; <span class="mono">β</span> scales the input; <span class="mono">s_i, b_i</span> are the scales and biases of each unit step.</li>
+        <li>To make it trainable, replace the hard staircase <span class="mono">𝒜</span> with a <strong>sigmoid</strong> <span class="mono">σ(Tx) = 1/(1+exp(−Tx))</span> and <strong>progressively increase <var>T</var></strong> during training — the function anneals from a smooth ramp (T=1) toward a sharp staircase (T=50, "complete quantization"). Related: differentiable soft quantization (Gong et al., 2019).</li>
+      </ul>
+
+      <h3>The deeper problem: quantization ignores the input</h3>
+      <p>The major drawback of naive quantization is that it <strong>doesn't consider the impact of the input</strong> when deciding how to round. A small weight that always multiplies a large, frequent activation can matter more than the rounding error suggests — and per-weight quantization can't see that.</p>
+      <div class="call key"><span class="k">Calibration-based reconstruction</span><p>The fix: use a <strong>calibration dataset</strong>, profile the real inputs/outputs <span class="mono">X<sub>l</sub>, Y<sub>l</sub></span> at each layer, and solve for the quantized weights that best <em>reproduce the layer's output</em> rather than best approximate the weights themselves:</p>
+      <div class="formula"><span class="eq">min<sub><var>W</var><sub>l</sub></sub>  ‖ <var>Y</var><sub>l</sub> − <var>X</var><sub>l</sub> Q(<var>W</var><sub>l</sub>) ‖²   for each layer <var>l</var></span><span class="lbl">output-aware, layer-wise</span></div>
+      <p>This output-reconstruction objective is the principle behind modern PTQ methods for LLMs — optimize what the layer <em>computes</em>, not just what it <em>stores</em>.</p>
+      </div>
+    </section>
+
+    <hr class="rule">
+
+    <section id="recap">
+      <div class="sec-head"><span class="num">★</span><h2>Exam recap</h2></div>
+      <div class="cards">
+        <div class="card"><p class="q">INT vs FP</p><p>INT = uniform steps; FP = relative precision (fine near 0, coarse when large) via 2<sup>e−bias</sup>×(1+m). BFP shares one exponent per block.</p></div>
+        <div class="card"><p class="q">Symmetric INT</p><p>s = 2L/(2ᵇ−2), x_int = round(clip(x)/s), x_q = s·x_int. The −2 keeps zero exactly representable.</p></div>
+        <div class="card"><p class="q">Asymmetric INT</p><p>s = (L_max−L_min)/(2ᵇ−1); add offset L_min back. Fits skewed data but drags an offset through every op; division impractical.</p></div>
+        <div class="card"><p class="q">Compute rules</p><p>Same scale: add = s(x+y), mul = s²(xy). FP: multiply is easy (sum exponents), add needs exponent alignment.</p></div>
+        <div class="card"><p class="q">Granularity</p><p>Per-tensor → row → column: finer = lower error but conversion overhead. Which axis wins depends on data layout.</p></div>
+        <div class="card"><p class="q">Clip range L</p><p>Weights are Gaussian-ish; L=0.9–0.95·max(|W|). Small L = truncation error, large L = error on small values. PACT learns L.</p></div>
+        <div class="card"><p class="q">PTQ vs QAT + STE</p><p>PTQ cheap/lossy (used for LLMs); QAT retrains. STE: quantize forward, ∂W′/∂W = 1 backward.</p></div>
+        <div class="card"><p class="q">Gradients are hard</p><p>Near-lognormal, very sensitive to quant error → use stochastic quantization; deterministic bias absorbed by BN.</p></div>
+        <div class="card"><p class="q">Learnable methods</p><p>PACT (learn L), QIL (learn the mapping F, w_q=Q(F(w))), QN (soft steps annealed via σ(Tx), T↑).</p></div>
+        <div class="card"><p class="q">Activation cost</p><p>Dynamic quantize/dequantize overhead can exceed MAC savings — low precision was slower than FP16 on a 4090.</p></div>
+        <div class="card"><p class="q">Extreme low bit</p><p>Binary {−1,1} / ternary {−1,0,1} = multiplication-free. Log arithmetic = power-of-two, multiply → bit-shift.</p></div>
+        <div class="card"><p class="q">Calibration</p><p>Quantization ignores the input; fix with min‖Y−X·Q(W)‖² per layer on a calibration set — output-aware reconstruction.</p></div>
+      </div>
+    </section>
+
+    <footer>
+      Study note compiled from <em>Lecture 05 — Quantization Strategies for Efficient DNN Implementation</em>, NYU SAI Lab, Spring 2026. Key references: Overton 1996 (FP representation) · Li, Hao et al. 2017 (STE / "Training quantized nets") · Choi et al. 2018 (PACT) · Jung et al. 2019 (QIL) · Yang et al. 2019 (Quantization Networks) · Gong et al. 2019 (Differentiable Soft Quantization) · Liu et al. 2020 (Bi-Real Net) · Chmiel et al. 2020 (near-lognormal neural gradients).
+    </footer>
+  </main>
+</div>
+<script src="theme.js"></script>
+</body>
+</html>

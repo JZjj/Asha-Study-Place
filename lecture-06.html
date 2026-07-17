@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lecture 06: Distillation, Low-Rank Decomposition, NAS &amp; Dynamic Computing — Study Note</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+  <nav class="toc">
+    <a class="home" href="index.html">← All lectures</a>
+    <div class="brand">06 · Distillation, Low-Rank, NAS &amp; Dynamic Computing</div>
+    <a href="#kd"><span class="n">01</span>Knowledge distillation</a>
+    <a class="sub" href="#kd">Response-based &amp; temperature</a>
+    <a class="sub" href="#kd">How smart the teacher · TA</a>
+    <a href="#variants"><span class="n">02</span>Distillation variants</a>
+    <a class="sub" href="#variants">Feature-based · online · self</a>
+    <a class="sub" href="#variants">Multi-teacher · cross-modal · LLM</a>
+    <a href="#nas"><span class="n">03</span>Neural architecture search</a>
+    <a class="sub" href="#nas">RL · DARTS · Proxyless · OFA</a>
+    <a href="#lowrank"><span class="n">04</span>Low-rank factorization</a>
+    <a class="sub" href="#lowrank">SVD · truncation · QSVD</a>
+    <a href="#dynamic"><span class="n">05</span>Dynamic computing</a>
+    <a class="sub" href="#dynamic">SkipNet · BranchyNet</a>
+    <a href="#recap"><span class="n">★</span>Exam recap</a>
+  </nav>
+
+  <main>
+    <header class="mast">
+      <p class="eyebrow">Lecture 06 · Study Note</p>
+      <h1>Distillation, Low-Rank Decomposition, Neural Architecture Search &amp; Dynamic Computing</h1>
+      <p class="sub">Four orthogonal ways to shrink or speed up a network that don't touch the weights' precision: transfer knowledge into a smaller student, factor big weight matrices into thin ones, let an algorithm design the architecture, and spend compute only where the input demands it.</p>
+      <div class="meta-row">
+        <span class="chip">NYU SAI Lab</span>
+        <span class="chip">Spring 2026</span>
+        <span class="chip">KD · NAS · SVD · dynamic</span>
+        <span class="chip">teacher/student · supernets</span>
+        <span class="chip">early exit</span>
+      </div>
+    </header>
+
+    <section id="kd">
+      <div class="sec-head"><span class="num">01</span><h2>Knowledge distillation</h2></div>
+      <p class="lede">Transfer knowledge from a large, complex model (or ensemble) into a single smaller model that can actually be deployed under real-world constraints. The student is <strong>smaller</strong> and need not share the teacher's architecture.</p>
+
+      <h3>The core setup <span class="tag">Hinton 2015</span></h3>
+      <p>A pretrained <em class="term">teacher</em> DNN produces <strong>soft labels</strong> — a full probability distribution over classes, e.g. <span class="mono">[0.2, 0.1, …, 0.1]</span> — rather than a one-hot <strong>hard label</strong>. The <em class="term">student</em> is trained to match those soft labels. Only the student's weights are updated; the teacher can be pretrained or trained jointly.</p>
+      <div class="call key"><span class="k">Why soft labels beat hard labels</span><p>A soft label carries <strong>more information</strong> than a one-hot target: it reveals the <em>class relationships</em> hidden in the hard label (a cat image scores some mass on "dog," none on "truck"). This "dark knowledge" improves the student's generalization and is what makes <strong>model compression without major accuracy loss</strong> possible.</p></div>
+
+      <h3>Response-based distillation <span class="tag">soft targets</span></h3>
+      <p>The student's loss combines two terms — the <strong>distillation loss</strong> (student vs. teacher soft labels) and the ordinary <strong>cross-entropy loss</strong> (student vs. hard labels):</p>
+      <div class="formula"><span class="eq">ℒ<sub>total</sub> = <var>c</var> · ℒ<sub>CE</sub>(hard) + (1−<var>c</var>) · ℒ<sub>distill</sub>(soft)</span><span class="lbl"><var>c</var> ≈ 0.9</span></div>
+      <p>Soft labels are produced by a <strong>temperature-scaled softmax</strong> over the logits <var>z<sub>i</sub></var>:</p>
+      <div class="formula"><span class="eq"><var>p</var>(<var>z<sub>i</sub></var>, <var>T</var>) = exp(<var>z<sub>i</sub></var>/<var>T</var>) ∕ Σ<sub>j</sub> exp(<var>z<sub>j</sub></var>/<var>T</var>)</span><span class="lbl"><var>T</var> = temperature</span></div>
+      <div class="call key"><span class="k">What temperature does</span><p><var>T</var> = 1 is the normal softmax. Raising <var>T</var> &gt; 1 <strong>softens</strong> the distribution — it flattens the peak so the small "wrong-class" probabilities grow, exposing more of the teacher's dark knowledge for the student to imitate. <var>z<sub>i</sub></var> are the <em>logits</em>, <var>p</var> is the resulting soft label.</p></div>
+
+      <h3>KL divergence — the distillation objective</h3>
+      <p>The distillation loss is usually a <em class="term">Kullback–Leibler divergence</em>, which measures how much a model distribution <var>Q</var> differs from a true distribution <var>P</var> (both discrete):</p>
+      <div class="formula"><span class="eq">D<sub>KL</sub>(<var>P</var> ‖ <var>Q</var>) = Σ<sub>x∈𝒳</sub> <var>P</var>(x) · log( <var>P</var>(x) ∕ <var>Q</var>(x) )</span><span class="lbl">≥ 0, = 0 iff P = Q</span></div>
+      <p>Applied to the student's prediction against the teacher's target:</p>
+      <div class="formula"><span class="eq">ℒ(<var>y</var><sub>true</sub>, <var>y</var><sub>pred</sub>) = <var>y</var><sub>true</sub> · log(<var>y</var><sub>true</sub> ∕ <var>y</var><sub>pred</sub>) = <var>y</var><sub>true</sub> · (log <var>y</var><sub>true</sub> − log <var>y</var><sub>pred</sub>)</span><span class="lbl">KL form</span></div>
+      <p style="font-size:13px;color:var(--muted)">If <var>P</var>(x) = <var>Q</var>(x) for all x the divergence is exactly 0; otherwise it is strictly positive.</p>
+
+      <h3>How smart does the teacher need to be? <span class="tag">Cho &amp; Hariharan 2019</span></h3>
+      <ul class="clean">
+        <li>Larger teachers are more accurate <em>on their own</em>, but that does <strong>not</strong> make them better teachers — a too-large teacher can even <strong>hurt</strong> the student.</li>
+        <li>As the teacher grows in capacity, the student <strong>can't find a solution in its own space</strong> that emulates the teacher well (shown across increasing depth and width of WRN/DenseNet teachers).</li>
+      </ul>
+      <div class="call good"><span class="k">Fix: early-stop the teacher</span><p>Grid-searching the ideal teacher architecture is too expensive. Instead, <strong>early stop (ES)</strong> the teacher's training — a slightly under-trained teacher produces softer, more imitable targets and consistently lowers student error vs. a fully-trained ("Full") teacher.</p></div>
+
+      <h3>Teacher Assistant (TAKD) <span class="tag">Mirzadeh 2020</span></h3>
+      <p>When the <strong>size gap</strong> between teacher and student is large, distillation breaks down. TAKD inserts <strong>intermediate-size TA networks</strong> to bridge it: the TA is first distilled from the teacher, then the TA plays teacher and distills into the student.</p>
+      <div class="tbl-scroll"><table>
+        <thead><tr><th>Model</th><th>Dataset</th><th>NOKD</th><th>BLKD</th><th>TAKD</th></tr></thead>
+        <tbody>
+          <tr><td>CNN</td><td>CIFAR-10</td><td>70.16</td><td>72.57</td><td><strong>73.51</strong></td></tr>
+          <tr><td>CNN</td><td>CIFAR-100</td><td>41.09</td><td>44.57</td><td><strong>44.92</strong></td></tr>
+          <tr><td>ResNet</td><td>CIFAR-10</td><td>88.52</td><td>88.65</td><td><strong>88.98</strong></td></tr>
+          <tr><td>ResNet</td><td>CIFAR-100</td><td>61.37</td><td>61.41</td><td><strong>61.82</strong></td></tr>
+          <tr><td>ResNet</td><td>ImageNet</td><td>65.20</td><td>66.60</td><td><strong>67.36</strong></td></tr>
+        </tbody>
+      </table></div>
+      <p style="font-size:13px;color:var(--muted)">NOKD = no distillation, BLKD = baseline (direct) KD, TAKD = teacher-assistant KD. Higher is better; TAKD wins across the board.</p>
+    </section>
+
+    <hr class="rule">
+
+    <section id="variants">
+      <div class="sec-head"><span class="num">02</span><h2>Distillation variants: where the knowledge comes from</h2></div>
+      <p class="lede">Response-based KD only uses the <strong>last layer's</strong> outputs. Richer schemes tap intermediate features, let peers teach each other, or let a model teach itself.</p>
+
+      <h3>Feature-based distillation <span class="tag">FitNets, Romero 2014</span></h3>
+      <p>Response-based knowledge fails to convey the teacher's <strong>intermediate-level supervision</strong>. Feature-based KD extracts intermediate <strong>feature maps</strong> from the teacher and uses them to guide the student — teaching it <em>how the teacher processes information</em>, which improves generalization and speeds convergence.</p>
+      <p>FitNets ("hints for thin deep nets") picks a <strong>hint</strong> layer in the teacher and a <strong>guided</strong> layer in the student, then minimizes their L2 distance. A regressor <var>r</var>(·) — itself conv layers — reshapes the student's feature map to the teacher's dimension:</p>
+      <div class="formula"><span class="eq">ℒ<sub>HT</sub>(<var>W</var><sub>Guided</sub>, <var>W</var><sub>r</sub>) = ½ · ‖ <var>u<sub>h</sub></var>(x; <var>W</var><sub>Hint</sub>) − <var>r</var>(<var>v<sub>g</sub></var>(x; <var>W</var><sub>Guided</sub>); <var>W</var><sub>r</sub>) ‖²</span><span class="lbl">hint-based training</span></div>
+
+      <h3>Online distillation — deep mutual learning <span class="tag">Zhang 2018</span></h3>
+      <p>No fixed teacher: an <strong>ensemble of students learns collaboratively</strong> and teaches each other throughout training. Each network minimizes its own cross-entropy plus a KL term pulling it toward the other's predictions:</p>
+      <div class="formula"><span class="eq">ℒ<sub>Θ₁</sub> = ℒ<sub>C₁</sub> + D<sub>KL</sub>(<var>p</var><sub>2</sub> ‖ <var>p</var><sub>1</sub>)   ,   ℒ<sub>Θ₂</sub> = ℒ<sub>C₂</sub> + D<sub>KL</sub>(<var>p</var><sub>1</sub> ‖ <var>p</var><sub>2</sub>)</span><span class="lbl">mutual KL</span></div>
+      <p>The two models start from <strong>different initial conditions</strong> and update alternately per mini-batch; the idea extends to a whole cohort of students learning mutually.</p>
+
+      <h3>Self-distillation <span class="tag">"Be your own teacher," Zhang 2019</span></h3>
+      <p>Split the network into blocks and <strong>condense knowledge from the deeper parts into the shallower ones</strong> — no separate teacher needed. Deep blocks supply distillation targets for shallow blocks alongside the hard-label cross-entropy.</p>
+      <div class="call key"><span class="k">Why it works</span><p>A model teaching itself with its own softened outputs encourages <strong>smoother decision boundaries</strong> and better internal consistency. It refines representations, reduces overfitting, and extracts richer knowledge from its own predictions.</p></div>
+
+      <h3>Multi-teacher &amp; cross-modal distillation</h3>
+      <ul class="clean">
+        <li><strong>Multi-teacher</strong> (You 2017): combine several teachers not just by <strong>averaging their softened outputs</strong> (dark knowledge) but also in intermediate layers, by imposing a constraint on the <em>relative dissimilarity</em> among examples. Teachers may differ in architecture or just in weights.</li>
+        <li><strong>Cross-modal</strong>: when labeled data for a new task is scarce (e.g. segmentation), pass <strong>unlabeled</strong> data to a teacher pretrained on a related task (e.g. classification) and use feature-based distillation. A teacher trained on a different vision task still understands visual inputs well enough to guide the student.</li>
+      </ul>
+
+      <h3>Distillation for quantization &amp; pruning</h3>
+      <p>Distillation isn't standalone — it can <strong>streamline the finetuning / retraining loop</strong> inside iterative pruning (prune part of the weights → retrain → repeat until the target sparsity is met) and inside quantization-aware training (quantize → train → repeat until convergence).</p>
+
+      <h3>Distillation for language models <span class="tag">Distilling step-by-step, Hsieh 2023</span></h3>
+      <p>Given unlabeled data, an LLM can provide both a <strong>ground-truth label</strong> and a <strong>rationale</strong> (feature). Distilling step-by-step trains much smaller models with <strong>less training data</strong> for both finetuning and distillation.</p>
+      <ul class="clean">
+        <li><strong>Chain-of-Thought (CoT)</strong> (Wei 2022): prompt the model to decompose a multi-step problem into intermediate steps, so more computation is allocated to harder problems. This is the mechanism that produces the rationales.</li>
+        <li>Use <strong>few-shot CoT prompting</strong> — an example rationale + an example label — to elicit a rationale on each new input; then train the small model on both the label and the rationale.</li>
+      </ul>
+      <div class="formula"><span class="eq">ℒ = ℒ<sub>label</sub> + λ · ℒ<sub>rationale</sub></span><span class="lbl">rationale-augmented loss</span></div>
+      <div class="call good"><span class="k">Why the rationale helps</span><p>The rationale-generation loss forces the small model to learn the <strong>intermediate reasoning steps</strong> behind a prediction, which in turn guides it toward the correct final label — richer supervision than the bare label alone.</p></div>
+
+      <h3>Relation between student and teacher</h3>
+      <p>The student should share <strong>some architectural similarity</strong> with the teacher. It can be a mini version (shallower, thinner), a <strong>pruned</strong> version, or a <strong>quantized</strong> version of the teacher — tying this lecture back to Lectures 04 and 05.</p>
+    </section>
+
+    <hr class="rule">
+
+    <section id="nas">
+      <div class="sec-head"><span class="num">03</span><h2>Neural architecture search (NAS)</h2></div>
+      <p class="lede">Stop hand-designing networks. <strong>NAS automates architecture design</strong>, using algorithms to explore the vast space of possible networks and find the most efficient, effective design for a task — replacing slow, suboptimal human experimentation.</p>
+
+      <h3>The three components</h3>
+      <p>Every NAS method decomposes into a loop between three parts. The scaling knobs of the search space are the usual suspects — <strong>width</strong> (#channels), <strong>depth</strong> (#layers), <strong>resolution</strong> (H×W), and their <strong>compound</strong> combination.</p>
+      <div class="tbl-scroll"><table>
+        <thead><tr><th>Component</th><th>Role</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Search space</strong> <span class="mono">𝒜</span></td><td>The set of candidate architectures, fixed by an encoding method</td></tr>
+          <tr><td><strong>Search strategy</strong></td><td>Proposes an architecture <var>a</var> ∈ <span class="mono">𝒜</span> to try</td></tr>
+          <tr><td><strong>Performance estimation</strong></td><td>Returns a performance estimate of <var>a</var>, feeding back into the strategy</td></tr>
+        </tbody>
+      </table></div>
+
+      <h3>RL-based NAS <span class="tag">Zoph &amp; Le 2016 · NASNet 2018</span></h3>
+      <p>An <strong>RNN controller</strong> generates the model description of a network; it is trained with <strong>reinforcement learning</strong> to maximize the expected validation accuracy of the architectures it generates.</p>
+      <ul class="clean">
+        <li>Loop: <strong>sample</strong> architecture <var>A</var> with probability <var>p</var> → <strong>train</strong> the child network to convergence → get validation accuracy <var>R</var> → <strong>scale the gradient of <var>p</var> by <var>R</var></strong> to update the controller.</li>
+        <li>The controller predicts, per layer: number of filters, filter height/width, stride height/width. The action at each step depends on <strong>all previous actions</strong> (it is recurrent). Reward = validation-set accuracy.</li>
+        <li><strong>NASNet</strong> transfers the searched cell to larger images: NASNet-A (6 @ 768) reaches <strong>3.41%</strong> CIFAR error (2.65% + cutout), competitive with far larger hand-designed nets.</li>
+      </ul>
+      <div class="call bad"><span class="k">The cost problem</span><p>RL-NAS trains a <strong>full child network to convergence</strong> for every sampled architecture — enormously expensive. The next three methods are all attempts to avoid that.</p></div>
+
+      <h3>DARTS — differentiable architecture search <span class="tag">Liu 2018</span></h3>
+      <p>Instead of discrete search, place a <strong>mixture of candidate operations on each edge</strong> and take a softmax-weighted sum, making the whole search space continuous and <strong>differentiable</strong>. With three candidate convs:</p>
+      <div class="formula"><span class="eq"><var>s<sub>i</sub></var> = exp(<var>a<sub>i</sub></var>) ∕ Σ<sub>j</sub> exp(<var>a<sub>j</sub></var>)   ,   <var>y</var> = <var>s</var><sub>1</sub><var>y</var><sub>1</sub> + <var>s</var><sub>2</sub><var>y</var><sub>2</sub> + <var>s</var><sub>3</sub><var>y</var><sub>3</sub></span><span class="lbl">softmax over ops</span></div>
+      <div class="formula"><span class="eq">ō<sup>(i,j)</sup>(x) = Σ<sub>o∈𝒪</sub> [ exp(α<sub>o</sub><sup>(i,j)</sup>) ∕ Σ<sub>o′</sub> exp(α<sub>o′</sub><sup>(i,j)</sup>) ] · o(x)</span><span class="lbl">mixed edge</span></div>
+      <p>Training is a <strong>bilevel optimization</strong>: architecture weights α on validation, network weights <var>w</var> on train.</p>
+      <div class="formula"><span class="eq">min<sub>α</sub> ℒ<sub>val</sub>(<var>w</var>*(α), α)   s.t.   <var>w</var>*(α) = argmin<sub>w</sub> ℒ<sub>train</sub>(<var>w</var>, α)</span><span class="lbl">bilevel</span></div>
+      <p>At the end, simply keep the operation with the highest <var>s</var> on each edge; an extra regularization term can push <var>s</var> toward one-hot.</p>
+
+      <h3>ProxylessNAS <span class="tag">Cai 2018</span></h3>
+      <p>Earlier methods search on a small <strong>proxy task</strong> then transfer. ProxylessNAS searches <strong>directly on the target task and target hardware</strong>. It keeps DARTS-style architecture parameters but adds <strong>binary gates</strong> (0 = prune, 1 = keep) so only <strong>one path sits in memory</strong> at a time — solving DARTS's memory blow-up. Weight params and architecture params are updated in alternating steps.</p>
+      <p>Crucially it makes <strong>latency differentiable</strong> and part of the loss, so the search is hardware-aware:</p>
+      <div class="formula"><span class="eq">𝔼[latency] = Σ<sub>i</sub> 𝔼[latency<sub>i</sub>] , where 𝔼[latency<sub>i</sub>] = α·F(conv3×3) + β·F(conv5×5) + … + ζ·F(pool3×3)</span><span class="lbl">expected latency</span></div>
+      <div class="formula"><span class="eq">Loss = Loss<sub>CE</sub> + λ<sub>1</sub>‖<var>w</var>‖₂² + λ<sub>2</sub> · 𝔼[latency]</span><span class="lbl">accuracy + latency</span></div>
+
+      <h3>Once-For-All (OFA) <span class="tag">Cai 2019</span></h3>
+      <p>Train <strong>one supernet</strong> that contains many smaller subnetworks — all trained <strong>jointly</strong>, with small subnets <strong>nested inside</strong> larger ones. Each forward pass samples a subnetwork and trains its weights. Once trained, you can <strong>directly deploy</strong> any subnet to Cloud / Mobile / Tiny-AI targets with <strong>no retraining</strong>.</p>
+      <ul class="clean">
+        <li>To pick a subnet, OFA builds <strong>neural-network-twins</strong> — a search DNN that takes an architecture as input and predicts its <strong>latency and accuracy</strong>, returning the subnet meeting the deployment criteria.</li>
+        <li>Twins are fit by sampling <strong>16K subnetworks</strong> at varied architectures and input sizes and measuring accuracy on 10K held-out validation images.</li>
+        <li>With <strong>progressive shrinking (PS)</strong>, OFA<sub>Large</sub> hits <strong>80.0% ImageNet top-1 at 595M MACs</strong> — a claimed <strong>14× MAC reduction</strong> vs. comparable models; OFA w/ PS reaches 76.0% at just 230M MACs.</li>
+      </ul>
+      <div class="call good"><span class="k">The payoff</span><p>OFA amortizes search: train the supernet <strong>once</strong>, then specialize for every deployment target for free — instead of re-running an expensive search per target — greatly cutting total training cost.</p></div>
+    </section>
+
+    <hr class="rule">
+
+    <section id="lowrank">
+      <div class="sec-head"><span class="num">04</span><h2>Low-rank factorization</h2></div>
+      <p class="lede">A big weight matrix often has redundant structure. Replace one <var>m</var>×<var>n</var> matrix with the product of two thin ones — and train the thin factors directly.</p>
+
+      <h3>The decomposition</h3>
+      <p>Factor a weight matrix <var>W</var> (<var>m</var>×<var>n</var>) into <var>W</var><sub>1</sub> (<var>m</var>×<var>r</var>) and <var>W</var><sub>2</sub> (<var>r</var>×<var>n</var>) with the inner rank <var>r</var> ≤ min(<var>m</var>, <var>n</var>):</p>
+      <div class="formula"><span class="eq"><var>W</var> = <var>W</var><sub>1</sub> · <var>W</var><sub>2</sub>   ,   <var>W</var><sub>1</sub> ∈ ℝ<sup>m×r</sup>, <var>W</var><sub>2</sub> ∈ ℝ<sup>r×n</sup></span><span class="lbl">train W₁, W₂ instead of W</span></div>
+      <p>You store and train the two small factors instead of <var>W</var> — less storage, fewer parameters, provided <var>r</var> is small enough.</p>
+
+      <h3>SVD as the tool <span class="tag">closed form</span></h3>
+      <p>Singular Value Decomposition writes <var>W</var> = <var>U</var> · <var>R</var> · <var>V</var><sup>T</sup>, which folds into the two-factor form:</p>
+      <ul class="clean">
+        <li><strong><var>V</var></strong> (<var>n</var>×<var>r</var>): orthonormal eigenvectors of <var>W</var><sup>T</sup><var>W</var>.</li>
+        <li><strong><var>U</var></strong> (<var>m</var>×<var>r</var>): orthonormal eigenvectors of <var>W</var><var>W</var><sup>T</sup>.</li>
+        <li><strong><var>R</var></strong>: the <var>r</var>×<var>r</var> diagonal <strong>singular-value matrix</strong>, where <var>r</var> is the rank of <var>W</var>.</li>
+      </ul>
+      <div class="call warn"><span class="k">Decomposition alone doesn't save anything</span><p>Parameters go from <var>mn</var> to <var>mr</var> + <var>rn</var> = <var>r</var>(<var>m</var>+<var>n</var>). At full rank <var>r</var> = min(<var>m</var>,<var>n</var>), giving min(<var>m</var>,<var>n</var>)(<var>m</var>+<var>n</var>) ≥ <var>mn</var> — the parameter count <strong>increases</strong>. The saving comes only from <strong>rank truncation</strong>.</p></div>
+
+      <h3>Compute cost tells the same story</h3>
+      <p>For an input <var>X</var> (<var>s</var>×<var>m</var>), the dense matmul <var>X</var><var>W</var> costs <span class="mono">smn</span>. Factored, it becomes two matmuls:</p>
+      <div class="formula"><span class="eq">cost(<var>X</var><var>W</var><sub>1</sub><var>W</var><sub>2</sub>) = smr + snr = s(<var>m</var>+<var>n</var>)<var>r</var> = s(<var>m</var>+<var>n</var>)·min(<var>m</var>,<var>n</var>)</span><span class="lbl">vs. dense smn</span></div>
+      <p>Again, without truncating <var>r</var> the computational cost <strong>rises</strong> — you must throw away small singular values to win.</p>
+
+      <h3>Rank truncation — worked example</h3>
+      <p>Take <var>A</var> = [[3,2],[2,3],[1,0]]. SVD gives singular values <strong>σ₁ = 5.24, σ₂ = 1.31</strong>. Truncate the smaller one and reconstruct from the top singular triplet:</p>
+      <div class="formula"><span class="eq"><var>A</var><sub>1</sub> = σ<sub>1</sub> <var>u</var><sub>1</sub> <var>v</var><sub>1</sub><sup>T</sup> ≈ [[2.9, 2.7], [2.7, 2.9], [1.3, 1.2]]</span><span class="lbl">rank-1 approximation</span></div>
+      <p>The approximation is close to the original while dropping half the singular structure — cutting compute and storage. Because a raw truncated SVD is only optimal in Frobenius norm, we can do better by <strong>finetuning the factors on real data</strong>:</p>
+      <div class="formula"><span class="eq">min<sub>W₁,W₂</sub> Σ<sub>X∈𝒟</sub> ‖ <var>X</var><var>W</var> − <var>X</var><var>W</var><sub>1</sub><var>W</var><sub>2</sub> ‖²</span><span class="lbl">local finetuning</span></div>
+
+      <h3>QSVD &amp; other decompositions</h3>
+      <ul class="clean">
+        <li><strong>QSVD</strong> (Wang 2025, NeurIPS): a joint SVD + quantization method for vision-language models — (1) <strong>joint SVD over the Q/K/V weights</strong>, (2) a <strong>learnable rank allocation</strong> per component, (3) <strong>post-training quantization</strong> with outlier smoothing — compressing QKV in low-precision VLMs.</li>
+        <li><strong>CP decomposition</strong> (Lebedev 2014) and <strong>Tucker decomposition</strong> (Kim 2015) generalize the idea to conv tensors; each trades computational efficiency against accuracy differently.</li>
+      </ul>
+    </section>
+
+    <hr class="rule">
+
+    <section id="dynamic">
+      <div class="sec-head"><span class="num">05</span><h2>Dynamic / conditional computation</h2></div>
+      <p class="lede">Don't run the whole network on every input. <strong>Activate only the parts you need</strong>, chosen at run time from the input itself — spending compute where the sample is hard and skipping it where the sample is easy.</p>
+
+      <h3>Dynamic channel pruning <span class="tag">Feature boosting &amp; suppression, Gao 2018</span></h3>
+      <p>A lightweight <strong>channel saliency predictor</strong> generates a channel-wise importance measure per input. It subsamples the previous feature map, predicts saliencies <var>g<sub>l</sub></var>(x), applies a <strong>winners-take-all</strong> gate π<sub>l</sub>(x) to keep only the top channels, and multiplies them back in (with ReLU) — <strong>boosting</strong> important channels and <strong>suppressing</strong> the rest without permanently deleting them.</p>
+
+      <h3>SkipNet &amp; dynamic gating <span class="tag">Wang 2018</span></h3>
+      <p>SkipNet is a modified residual network with a <strong>gating network</strong> that selectively <strong>skips whole conv blocks</strong> based on the activations of the previous layer. Easy inputs skip many blocks; hard inputs use more.</p>
+      <div class="formula"><span class="eq">G<sub>relax</sub>(x) = 𝕀(S(x) ≥ 0.5) on the forward pass ;   S(x) on the backward pass</span><span class="lbl">gate w/ STE</span></div>
+      <div class="call key"><span class="k">Why two definitions of the gate</span><p>The <strong>forward pass needs a hard binary</strong> decision (run the block or not), but a step function has zero gradient. So the <strong>backward pass uses the straight-through estimator (STE)</strong> — it substitutes the smooth <var>S</var>(x) so gradients can flow and the gating network is trainable.</p></div>
+
+      <h3>Early exit — BranchyNet <span class="tag">Teerapittayanon 2016</span></h3>
+      <p>Data samples are <strong>not equal in difficulty</strong> (CIFAR10-Easy vs. CIFAR10-Hard). Easy samples only need a few layers to be classified correctly, so BranchyNet adds <strong>side exit branches</strong> along the backbone. At inference a <strong>confidence score</strong> is computed at each exit; if it clears a threshold, the output is produced <strong>locally</strong> and the rest of the network is skipped — faster inference.</p>
+      <div class="formula"><span class="eq">entropy(<var>y</var>) = Σ<sub>c∈𝒞</sub> <var>y<sub>c</sub></var> · log <var>y<sub>c</sub></var></span><span class="lbl">confidence / exit criterion</span></div>
+      <div class="call good"><span class="k">The unifying intuition</span><p>Dynamic channel pruning, SkipNet gating, and BranchyNet early exit are three granularities of the same idea — <strong>allocate compute per input</strong>: skip channels, skip blocks, or skip the entire tail of the network once the answer is already confident.</p></div>
+    </section>
+
+    <hr class="rule">
+
+    <section id="recap">
+      <div class="sec-head"><span class="num">★</span><h2>Exam recap</h2></div>
+      <div class="cards">
+        <div class="card"><p class="q">KD in one line</p><p>Train a small student to match a big teacher's <strong>soft labels</strong>. Loss = <var>c</var>·CE + (1−<var>c</var>)·distill, <var>c</var>≈0.9.</p></div>
+        <div class="card"><p class="q">Temperature</p><p>p(z,T)=softmax(z/T). Higher <var>T</var> softens the distribution, exposing dark knowledge. Distill loss is a KL divergence.</p></div>
+        <div class="card"><p class="q">Teacher size</p><p>Bigger ≠ better teacher; too-large hurts. Fix with <strong>early stop</strong> or a <strong>teacher assistant</strong> (TAKD) to bridge the gap.</p></div>
+        <div class="card"><p class="q">KD variants</p><p>Feature-based (FitNets hints), online (mutual learning), self-distillation, multi-teacher, cross-modal, LLM step-by-step.</p></div>
+        <div class="card"><p class="q">NAS components</p><p>Search space 𝒜 → search strategy → performance estimation, in a loop.</p></div>
+        <div class="card"><p class="q">NAS methods</p><p>RL controller (expensive) → DARTS (differentiable, softmax edges) → ProxylessNAS (binary gates + latency) → OFA (one supernet).</p></div>
+        <div class="card"><p class="q">Low-rank / SVD</p><p>W=W₁W₂. Only helps <strong>with rank truncation</strong> (drop small σ). Cost s(m+n)r; finetune factors on data.</p></div>
+        <div class="card"><p class="q">Dynamic compute</p><p>Spend compute per input: dynamic channels (FBS), skip blocks (SkipNet+STE), early exit (BranchyNet, entropy threshold).</p></div>
+      </div>
+    </section>
+
+    <footer>
+      Study note compiled from <em>Lecture 06 — Distillation, Low Rank Decomposition, Neural Architecture Search and Dynamic Computing</em>, NYU SAI Lab, Spring 2026. Key references: Hinton 2015 · Romero (FitNets) 2014 · Srivastava 2015 · Zhang (mutual) 2018 · Zhang (self) 2019 · You 2017 · Cho &amp; Hariharan 2019 · Mirzadeh (TAKD) 2020 · Wei (CoT) 2022 · Hsieh (step-by-step) 2023 · Zoph &amp; Le 2016 · Zoph (NASNet) 2018 · Liu (DARTS) 2018 · Cai (ProxylessNAS) 2018 · Cai (OFA) 2019 · Wang (QSVD) 2025 · Lebedev (CP) 2014 · Kim (Tucker) 2015 · Gao (FBS) 2018 · Wang (SkipNet) 2018 · Teerapittayanon (BranchyNet) 2016.
+    </footer>
+  </main>
+</div>
+<script src="theme.js"></script>
+</body>
+</html>

@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lecture 07: Efficiency Strategies for LLMs — Study Note</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+  <nav class="toc">
+    <a class="home" href="index.html">← All lectures</a>
+    <div class="brand">07 · LLM Efficiency</div>
+    <a href="#inference"><span class="n">01</span>Inference &amp; the KV cache</a>
+    <a href="#outliers"><span class="n">02</span>Data distribution &amp; outliers</a>
+    <a class="sub" href="#outliers">Massive vs channelwise</a>
+    <a class="sub" href="#outliers">Why they exist · how they form</a>
+    <a href="#smoothing"><span class="n">03</span>Quantization: outlier smoothing</a>
+    <a class="sub" href="#smoothing">SmoothQuant · AWQ</a>
+    <a class="sub" href="#smoothing">QuaRot · DuQuant · SpinQuant</a>
+    <a href="#fitting"><span class="n">04</span>Quantization: fitting the scales</a>
+    <a href="#pruning"><span class="n">05</span>Pruning large models</a>
+    <a href="#lowrank"><span class="n">06</span>Low-rank decomposition</a>
+    <a href="#recap"><span class="n">★</span>Exam recap</a>
+  </nav>
+
+  <main>
+    <header class="mast">
+      <p class="eyebrow">Lecture 07 · Study Note</p>
+      <h1>Efficiency Strategies for Large Language Models</h1>
+      <p class="sub">Why LLM inference is memory-bound, where the weird outliers in activations come from, and the four families of fixes — quantization (with outlier smoothing), pruning, KV-cache tricks, and low-rank decomposition.</p>
+      <div class="meta-row">
+        <span class="chip">NYU SAI Lab</span>
+        <span class="chip">Spring 2026</span>
+        <span class="chip">Prefill · decode · KV cache</span>
+        <span class="chip">SmoothQuant · QuaRot · Wanda · QSVD</span>
+      </div>
+    </header>
+
+    <section id="inference">
+      <div class="sec-head"><span class="num">01</span><h2>Autoregressive inference &amp; the KV cache</h2></div>
+      <p class="lede">Everything in this lecture exists to fight one fact: a decoder LLM generates <strong>one token at a time</strong>, re-using every past token's key/value on every step. That re-use is what the KV cache stores — and what dominates memory.</p>
+
+      <h3>Generation is autoregressive <span class="tag">GPT-style</span></h3>
+      <p>A stack of decoder blocks (each = self-attention + FFN) predicts the next token from all previous tokens. The output is fed back in as the next input — round after round — until <span class="mono">&lt;EOS&gt;</span>. Because attention needs the key and value of <em>every</em> earlier token, we must <strong>buffer K and V</strong> rather than recompute them.</p>
+      <div class="call key"><span class="k">Why cache K and V</span><p>In block <span class="mono">Q Kᵀ → softmax → ·V</span>, the query is only the <em>current</em> token, but the keys/values span the whole history. Recomputing all past K/V every step would be quadratic redundant work, so they are saved once and reused — this buffer is the <em class="term">KV cache</em>.</p></div>
+
+      <h3>Two phases: prefill vs decode</h3>
+      <div class="tbl-scroll"><table>
+        <thead><tr><th>Phase</th><th>What happens</th><th>Compute character</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Prefill</strong></td><td>The entire prompt / context is processed <strong>jointly</strong> in one pass; every token's K/V is written into the cache.</td><td>Large matmuls over all prompt tokens — <strong>compute-bound</strong>, parallel.</td></tr>
+          <tr><td><strong>Decode</strong></td><td>Generate responses one token at a time; each round appends the new token's K/V and reads the whole cache back.</td><td>One tiny query vs a growing cache — <strong>memory-bound</strong>, serial.</td></tr>
+        </tbody>
+      </table></div>
+      <p>Notation from the slides: <span class="mono">K<sub>i,j</sub></span> is the key vector for the <var>i</var>-th token in the <var>j</var>-th layer, shape <span class="mono">1×E</span>; <span class="mono">V<sub>i,j</sub></span> the matching value vector. The cache holds one K and one V per token, per layer.</p>
+      <div class="formula"><span class="eq">KV cache ∝ 2 × <var>n</var><sub>layers</sub> × <var>L</var> × <var>E</var> × precision</span><span class="lbl">K + V, per token, per layer</span></div>
+      <div class="call bad"><span class="k">The bottleneck</span><p>The cache grows <strong>linearly with sequence length</strong> and never shrinks during a generation. Long contexts make decode dominated by <strong>reading the cache from memory</strong>, not by arithmetic — so cutting KV memory (quantize it, prune it, or share it) is the highest-leverage lever for decode speed.</p></div>
+    </section>
+
+    <hr class="rule">
+
+    <section id="outliers">
+      <div class="sec-head"><span class="num">02</span><h2>Large-model data distribution: the outlier problem</h2></div>
+      <p class="lede">You cannot quantize an LLM naively — its activations contain enormous <strong>outliers</strong> that blow up the quantization range. Understanding <em>what kind</em> of outlier and <em>why it exists</em> is the whole basis of LLM quantization.</p>
+
+      <h3>First, why activation quantization is hard</h3>
+      <ul class="clean">
+        <li><strong>Activation quantization must be dynamic</strong> — ranges depend on the input, so scales are computed at run time, adding compute overhead.</li>
+        <li>Activations then pass <strong>nonlinear functions</strong> that are very sensitive to quantization error, so you must <strong>dequantize back to FP16/32</strong> around them (<span class="mono">FP2INT → INT matmul → INT2FP → norm → ReLU → …</span>).</li>
+        <li>Still worth it: for large models with heavy compute demand, even dynamically-quantized activations <strong>significantly reduce latency</strong>.</li>
+      </ul>
+
+      <h3>Granularity of quantization</h3>
+      <p>Weights and activations can be quantized at different granularities, trading accuracy against hardware cost:</p>
+      <div class="cards">
+        <div class="card"><p class="q">Tensor-based</p><p>One scale for the whole tensor. Cheapest hardware, highest quant error.</p></div>
+        <div class="card"><p class="q">Vector-based</p><p>One scale per row/column vector. Middle ground.</p></div>
+        <div class="card"><p class="q">Group-based</p><p>One scale per small group of elements. Lowest error, highest hardware cost.</p></div>
+      </div>
+      <div class="call key"><span class="k">The rule</span><p><strong>Higher granularity → lower quantization error but higher hardware implementation cost.</strong> Finer scales isolate outliers into smaller groups, but each group needs its own scale/zero-point bookkeeping.</p></div>
+
+      <h3>Two kinds of outlier <span class="tag">the taxonomy</span></h3>
+      <p>For an activation matrix <var>A</var>, the lecture defines two distinct outlier phenomena with concrete thresholds:</p>
+      <div class="formula"><span class="eq"><strong>Massive:</strong> <var>A<sub>ij</sub></var> &gt; η·mean(|<var>A</var>|)  and  <var>A<sub>ij</sub></var> &gt; γ</span><span class="lbl">e.g. η=300, γ=50</span></div>
+      <div class="formula"><span class="eq"><strong>Channelwise:</strong> mean(<var>A<sub>i</sub></var>) &gt; η·std(<var>A</var>)+mean(|<var>A</var>|)  and  std(<var>A<sub>i</sub></var>) &lt; β</span><span class="lbl">e.g. η=3, β=0.6</span></div>
+      <ul class="clean">
+        <li><strong>Massive activation:</strong> a <em>single element</em> that is gigantic relative to the mean (can reach into the thousands). Sparse but extreme.</li>
+        <li><strong>Channelwise outlier:</strong> an entire <em>channel</em> whose mean is high but whose spread is <em>low</em> — a whole column consistently offset.</li>
+      </ul>
+
+      <h3>Where they show up — CLIP and LLaMA</h3>
+      <p>Profiling <a class="cite" href="#">CLIP</a> (Radford et al., 2021; image encoder ×24, fusion ×40) shows massive activations at intermediate positions <span class="mono">x₁, y₁, y₅</span>, while <span class="mono">x₂</span> exhibits <strong>channelwise</strong> outliers that persist across layers. The same massive activations appear in <strong>LLaMA2-13B</strong> (Sun et al., "Massive Activations in LLMs," 2402.17762): a single spike in <span class="mono">x₁</span> that dwarfs every other value.</p>
+
+      <div class="call good"><span class="k">Why massive activations exist · Sun et al. 2024</span><p>They are <strong>not random spikes or errors</strong> — they are <em>learned, input-agnostic constants</em> that act as <strong>implicit bias terms</strong>. The argument: LLMs use them to inject bias into the self-attention computation, letting certain tokens <strong>always attract disproportionately high attention</strong> (an attention "anchor"). The lecture notes <em>no clear conclusion has been reached</em>.</p></div>
+
+      <div class="call bad"><span class="k">And they are load-bearing · Raman, Sharma &amp; Zhang 2025</span><p>Truncating massive activations (setting them to the mean or to zero at <span class="mono">y₇</span>) causes <strong>catastrophic perplexity blow-up</strong> — e.g. LLaMA2-13B WikiText goes from <strong>4.36 → ~1.3 million</strong>. The distortion is real, but you cannot simply delete them. Massive activations also occur in other attention-based foundation models.</p></div>
+
+      <h3>How a massive activation propagates <span class="tag">Llama-2 7B</span></h3>
+      <ul class="clean">
+        <li><span class="mono">y₇</span> of <strong>layer 3</strong> first produces the massive activation (MA), inside the <strong>first text token</strong>; it first appears in <span class="mono">y₆</span> of token 0.</li>
+        <li>In the following layers, <span class="mono">x₁</span> and <span class="mono">y₁</span> carry the MA — magnitudes that can reach the <strong>thousands</strong> (top-magnitude of <span class="mono">x₁</span> jumps to ~1400 from layer 4 onward).</li>
+        <li>The MA then <strong>propagates through the residual link</strong> across layers, which is why it appears everywhere downstream.</li>
+        <li>Nuance: truncating the MA that is <em>carried by the residual connection</em> does <strong>not</strong> cause a large accuracy drop — it is the <em>originating</em> MA that matters.</li>
+      </ul>
+
+      <h3>How channelwise outliers form</h3>
+      <p>The layer-normalization pipeline itself manufactures channelwise outliers in two steps:</p>
+      <div class="formula"><span class="eq">Step 1 — standardize:  <var>X′</var> = (<var>X<sub>r</sub></var> − μ<sub>r</sub>) / σ<sub>r</sub>   for each <var>r</var>∈<var>L</var></span><span class="lbl">per-token normalize</span></div>
+      <div class="formula"><span class="eq">Step 2 — scale + bias:  <var>Y<sub>e</sub></var> = α<sub>e</sub><var>X′<sub>e</sub></var> + β<sub>e</sub>   for each <var>e</var>∈<var>E</var></span><span class="lbl">per-channel affine</span></div>
+      <ul class="clean">
+        <li><span class="mono">x₁</span> already contains <em>some</em> channelwise outliers, but not significant ones.</li>
+        <li><strong>Standardization amplifies them:</strong> when a token's standard deviation σ<sub>r</sub> is <strong>low</strong>, dividing by it makes channel outliers far more pronounced.</li>
+        <li>The <strong>scale (α) and bias (β)</strong> factors of the norm layer add still more — profiling CLIP's <span class="mono">ln_weight</span>/<span class="mono">ln_bias</span> shows spiky per-channel values.</li>
+        <li>Root cause of the pre-existing outliers in <span class="mono">x₁</span>: the output projection <strong>W<sub>out</sub></strong> produces minor channelwise outliers in <span class="mono">y₅</span>, and the residual link carries those forward from preceding layers.</li>
+      </ul>
+
+      <div class="call key"><span class="k">The strategy this motivates</span><p>Standard LLM post-training quantization is <strong>two stages</strong>: <strong>①&nbsp;outlier smoothing</strong> (redistribute the difficulty) then <strong>②&nbsp;post-training quantization</strong>. Sections 3–4 are exactly these two stages.</p></div>
+    </section>
+
+    <hr class="rule">
+
+    <section id="smoothing">
+      <div class="sec-head"><span class="num">03</span><h2>Quantization stage 1: outlier smoothing</h2></div>
+      <p class="lede">If activations have outliers and weights don't, <strong>move the difficulty into the weights</strong> — or <strong>rotate/permute it away</strong> — using a transformation that leaves the math unchanged. Every method here is a mathematically-equivalent rewrite of <span class="mono">Y = AW</span>.</p>
+
+      <h3>SmoothQuant <span class="tag">migrate difficulty</span></h3>
+      <p>Xiao et al. (PMLR 2023). Divide the activation by a per-channel factor <var>s</var> and multiply the matching weight row by the same <var>s</var> — the product is identical, but now <em>both</em> are easy to quantize.</p>
+      <div class="formula"><span class="eq"><var>Y</var> = (<var>X</var>·diag(<var>s</var>)⁻¹)·(diag(<var>s</var>)·<var>W</var>) = <var>X̂ Ŵ</var></span><span class="lbl">equivalent transform</span></div>
+      <div class="formula"><span class="eq"><var>s<sub>j</sub></var> = max(|<var>X<sub>j</sub></var>|)<sup>α</sup> / max(|<var>W<sub>j</sub></var>|)<sup>1−α</sup></span><span class="lbl">per-channel smoothing factor</span></div>
+      <div class="call key"><span class="k">Reading the knob</span><p><var>α</var> is a hyperparameter tuned on a <strong>calibration dataset</strong>. It slides difficulty between activations (large α) and weights (small α). The <var>i</var>-th <em>column</em> of <var>X</var> pairs with the <var>i</var>-th <em>row</em> of <var>W</var>, so the rescale is exact.</p></div>
+
+      <h3>AWQ — Activation-aware Weight Quantization</h3>
+      <p>Lin et al. (MLSys 2024). Same shape as SmoothQuant, but instead of a hand-set formula it makes the scale <strong>learnable</strong>, minimizing the actual output error:</p>
+      <div class="formula"><span class="eq"><var>s</var>* = argmin<sub>s</sub> ℒ(<var>s</var>),  ℒ(<var>s</var>) = ‖<var>Q</var>(<var>W</var>·diag(<var>s</var>))(diag(<var>s</var>)⁻¹<var>X</var>) − <var>WX</var>‖</span><span class="lbl">learn the scale</span></div>
+      <p>Across LLaMA / Llama-2 at INT3-g128 and INT4-g128, AWQ beats round-to-nearest and GPTQ on WikiText perplexity — e.g. Llama-2-7B INT4-g128 reaches <strong>5.60</strong> vs FP16's 5.47.</p>
+
+      <h3>QuaRot — rotate the outliers away <span class="tag">orthogonal R</span></h3>
+      <p>Ashkboos et al. (2404.00456). Insert an orthogonal matrix <var>R</var> (<span class="mono">RᵀR = RRᵀ = I</span>) between activation and weight. It cancels out mathematically but <strong>spreads the outliers</strong> so both <var>AR</var> and <var>RᵀW</var> quantize cleanly:</p>
+      <div class="formula"><span class="eq">(<var>AR</var>)·(<var>RᵀW</var>) = <var>AW</var>   ⇒   <var>Q</var>(<var>AR</var>)<var>Q</var>(<var>RᵀW</var>)</span><span class="lbl">outlier-free 4-bit</span></div>
+      <ul class="clean">
+        <li><strong>Offline vs online:</strong> <span class="mono">RᵀW</span> is folded into the weights offline; <span class="mono">AR</span> is absorbed by modifying the previous layer's weight matrix — <strong>almost no extra inference cost</strong>.</li>
+        <li><strong>The catch with nonlinearities:</strong> <span class="mono">LN(AWR) ≠ LN(AW)×R</span>. When a nonlinear function (norm, RoPE, softmax) follows the linear layer, the rotation must be applied <strong>online</strong>.</li>
+        <li><strong>Fix:</strong> use a <em class="term">Hadamard matrix</em> (entries only +1/−1) so the online rotation is just adds/subtracts — cheap enough to run dynamically around RoPE and the KV cache.</li>
+      </ul>
+
+      <h3>DuQuant &amp; SpinQuant — more transforms</h3>
+      <div class="tbl-scroll"><table>
+        <thead><tr><th>Method</th><th>Transform</th><th>Idea</th></tr></thead>
+        <tbody>
+          <tr><td><strong>DuQuant</strong><br><span style="color:var(--muted);font-size:12px">Lin et al. NeurIPS 2024</span></td><td>Permutation <var>P</var> (<span class="mono">PᵀP = PPᵀ = I</span>): <span class="mono">(AP)(PᵀW)=AW</span></td><td>A permutation also leaves the output unchanged but <strong>redistributes outliers across quantization groups</strong>. DuQuant combines <strong>scalar-, rotation-, and permutation-based</strong> invariances to mitigate outliers.</td></tr>
+          <tr><td><strong>SpinQuant</strong><br><span style="color:var(--muted);font-size:12px">Liu et al. 2405.16406</span></td><td><span class="mono">argmin<sub>R∈M</sub> ℒ<sub>Q</sub>(R₁,R₂ | W,X)</span></td><td><strong>Learns</strong> the rotation matrices to minimize the training-loss change. To keep <var>R</var> orthogonal during optimization it uses <strong>Cayley optimization</strong> (optimize on the manifold of orthogonal matrices).</td></tr>
+        </tbody>
+      </table></div>
+      <div class="call good"><span class="k">The through-line</span><p>Scaling (SmoothQuant/AWQ), rotation (QuaRot/SpinQuant), and permutation (DuQuant) are all <strong>invariance tricks</strong>: apply <var>T</var> to the activation and <var>T</var>⁻¹ to the weight so <span class="mono">Y</span> is unchanged, but the outliers are flattened before quantization.</p></div>
+    </section>
+
+    <hr class="rule">
+
+    <section id="fitting">
+      <div class="sec-head"><span class="num">04</span><h2>Quantization stage 2: fitting the quantized parameters</h2></div>
+      <p class="lede">Once outliers are smoothed, you still have to <em>choose</em> the quantized weights/scales. Use a small <strong>calibration dataset</strong> and optimize each layer to reproduce its own outputs — the only question is whether you do it in parallel or in sequence.</p>
+
+      <h3>Parallel vs sequential update</h3>
+      <div class="tbl-scroll"><table>
+        <thead><tr><th></th><th>Parallel update</th><th>Sequential update</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Calibration data</strong></td><td>Profile <span class="mono">x<sub>c</sub>, y<sub>c,1</sub>, y<sub>c,2</sub>, y<sub>c,3</sub></span> once from the full-precision model.</td><td>Profile only the first layer, quantize it, then <strong>regenerate</strong> the input for the next layer from the <em>already-quantized</em> previous layer.</td></tr>
+          <tr><td><strong>Objective (layer ℓ)</strong></td><td colspan="2"><span class="mono">min<sub>θℓ</sub> Σ ‖y<sub>c,ℓ</sub> − F<sup>ℓ</sup><sub>θℓ</sub>(x<sub>c,ℓ</sub>)‖²</span></td></tr>
+          <tr><td><strong>Input to layer ℓ</strong></td><td>Original full-precision activation.</td><td><span class="mono">x<sub>c,ℓ</sub> = F<sup>ℓ−1</sup><sub>θ*</sub>(x<sub>c,ℓ−1</sub>)</span> — uses the quantized layer's real output.</td></tr>
+          <tr><td><strong>Trade-off</strong></td><td>Simple, all layers at once; ignores compounding error.</td><td><strong>Accounts for accumulated quantization error</strong> down the stack; must be done in order to the final layer.</td></tr>
+        </tbody>
+      </table></div>
+      <div class="call key"><span class="k">Why sequential wins on accuracy</span><p>Each quantized layer perturbs its output slightly. Sequential update <strong>feeds that perturbed output into the next layer's calibration</strong>, so later layers compensate for earlier errors instead of assuming perfect inputs.</p></div>
+
+      <h3>AdaQuant <span class="tag">learn scale + correction</span></h3>
+      <p>Hubara et al. (PMLR 2021). Jointly optimizes the weight scale <span class="mono">Δ<sub>w</sub></span>, activation scale <span class="mono">Δ<sub>x</sub></span>, and a weight correction <span class="mono">V</span> against the layer's FP output, on a small calibration set:</p>
+      <div class="formula"><span class="eq">(Δ̂<sub>w</sub>, Δ̂<sub>x</sub>, V̂) = argmin ‖<var>WX</var> − <var>Q</var><sub>Δw</sub>(<var>W′</var>)<var>Q</var><sub>Δx</sub>(<var>X</var>)‖²</span><span class="lbl">AdaQuant</span></div>
+      <p>A <strong>Sequential AdaQuant</strong> variant threads each layer's quantized output into the next, with <span class="mono">X<sub>q</sub> = σ(Q<sub>Δw</sub>(W<sub>ℓ−1</sub>+V<sub>ℓ−1</sub>)·Q<sub>Δx</sub>(X<sup>q</sup><sub>ℓ−1</sub>))</span>.</p>
+
+      <h3>Clustering instead of quantization — LUT inference</h3>
+      <p>Uniform quantization snaps values to a fixed grid, which handles outliers badly. <strong>Clustering</strong> (K-means on activations and weights) places centroids where the data actually is, so it <strong>tolerates outliers far better</strong>.</p>
+      <div class="tbl-scroll"><table>
+        <thead><tr><th>Values</th><th>Uniform quant → error</th><th>Clustering → error</th></tr></thead>
+        <tbody>
+          <tr><td><span class="mono">10.4 1.2 8.7 0.6 9.9 2.2 1.8 12.0</span></td><td>snaps to grid → <strong>1.3 (high)</strong></td><td>centroids <span class="mono">10.25 / 1.45</span> → <strong>0.75 (low)</strong></td></tr>
+        </tbody>
+      </table></div>
+      <ul class="clean">
+        <li><strong>LUT-based inference:</strong> with a 4-bit input and <var>K</var> weight centroids, every possible <span class="mono">(input-centroid × weight-centroid)</span> product is precomputed into a <strong>lookup table</strong> — multiply/add become table reads.</li>
+        <li><strong>CodeQuant</strong> (Yin et al., ICLR 2026) unifies clustering + quantization for low-precision <strong>Mixture-of-Experts</strong>: ① activation-oriented outlier smoothing, ② permutation-invariant outlier grouping, ③ adaptive weight clustering + centroid finetuning, ④ LUT-based kernel/system design.</li>
+      </ul>
+      <div class="call good"><span class="k">Key insight</span><p>Compared to quantization, the <strong>clustering operation exhibits greater tolerance to outliers</strong> — centroids can sit on an extreme value instead of stretching a whole uniform grid to reach it.</p></div>
+    </section>
+
+    <hr class="rule">
+
+    <section id="pruning">
+      <div class="sec-head"><span class="num">05</span><h2>Pruning on large models</h2></div>
+      <p class="lede">Two pruning fronts on an LLM: prune the <strong>weights</strong> (Wanda) with input awareness, and prune the <strong>KV cache</strong> — the memory that actually chokes decoding.</p>
+
+      <h3>Weight pruning: from magnitude to Wanda</h3>
+      <p>Plain magnitude pruning zeros the smallest weights, but its major drawback is that it <strong>ignores the input</strong> — a small weight that always multiplies a large activation still matters. <em class="term">Wanda</em> (Sun et al., 2306.11695) fixes this by scoring each weight with the input's norm:</p>
+      <div class="formula"><span class="eq">Magnitude: <var>S</var> = |<var>W</var>|      Wanda: <var>S</var> = |<var>W</var>| · ‖<var>X</var>‖₂</span><span class="lbl">importance score</span></div>
+      <ul class="clean">
+        <li>If a weight's corresponding input magnitude is large, its output is large → keep it. Scores are grouped <strong>per output</strong>.</li>
+        <li>Needs a few <strong>calibration samples</strong> to estimate <span class="mono">‖X‖₂</span>, but introduces <strong>no weight update</strong>.</li>
+        <li>On WikiText, Wanda matches SparseGPT (which <em>does</em> update weights) at 50%, 4:8, and 2:4 sparsity — e.g. Llama-2-7B 50%: Wanda <strong>6.42</strong> vs SparseGPT 6.51, no retraining.</li>
+      </ul>
+
+      <h3>KV-cache pruning <span class="tag">attacks decode memory</span></h3>
+      <p>The KV cache is the decode bottleneck (§1), so drop the entries that don't matter. Ge et al. ("Model tells you what to discard," 2310.01801) profile the <strong>attention score of each token</strong> and find:</p>
+      <ul class="clean">
+        <li>Different attention <strong>heads</strong> weight KV vectors very differently (some care about special tokens, some about locality, some about punctuation, some are diffuse).</li>
+        <li>KV importance also <strong>varies across layers</strong> — so the pruning policy should be adaptive per head and per layer, not global.</li>
+      </ul>
+
+      <h3>StreamingLLM &amp; the attention sink</h3>
+      <p>Xiao et al. (2309.17453). Naive <strong>window attention</strong> (keep only the last <var>L</var> tokens' KV) collapses in quality. The surprising fix:</p>
+      <div class="call key"><span class="k">Attention sink</span><p>Simply <strong>keeping the KV of the first few tokens</strong> — alongside the sliding window — largely recovers full performance. LLMs place <strong>strong attention on initial tokens as a "sink,"</strong> even when those tokens are not semantically important (they soak up leftover softmax mass). StreamingLLM = a handful of sink tokens + a rolling window, giving bounded KV memory for effectively infinite streams.</p></div>
+      <p>The progression: <strong>(a) dense</strong> (full cache) → <strong>(b) window</strong> (evict old, quality drops) → <strong>(c) sliding window w/ recomputation</strong> (expensive) → <strong>(d) StreamingLLM</strong> (sink + window, cheap and stable).</p>
+    </section>
+
+    <hr class="rule">
+
+    <section id="lowrank">
+      <div class="sec-head"><span class="num">06</span><h2>Low-rank decomposition for LLMs</h2></div>
+      <p class="lede">A big weight matrix is often approximately low-rank. Factor <span class="mono">W ≈ W₁W₂</span> and you shrink parameters, MACs, <em>and</em> — done right in attention — the KV cache itself.</p>
+
+      <h3>The basic factorization</h3>
+      <p>Replace an <var>m×n</var> weight <var>W</var> by two thin matrices <var>W₁</var> (<var>m×r</var>) and <var>W₂</var> (<var>r×n</var>) with rank <var>r</var> ≤ min(<var>m,n</var>). Train <var>W₁, W₂</var> directly instead of <var>W</var>.</p>
+      <div class="formula"><span class="eq"><var>W</var><sub>m×n</sub> = <var>W₁</var><sub>m×r</sub> · <var>W₂</var><sub>r×n</sub></span><span class="lbl">low-rank form</span></div>
+      <div class="formula"><span class="eq">params: <var>mn</var> → <var>r</var>(<var>m</var>+<var>n</var>)   ·   compute: <var>smn</var> → <var>s</var>(<var>m</var>+<var>n</var>)<var>r</var></span><span class="lbl">savings need r small</span></div>
+      <div class="call warn"><span class="k">Only helps with rank truncation</span><p>Full SVD gives <var>W = U R Vᵀ</var> where <var>V</var> holds eigenvectors of <var>WᵀW</var>, <var>U</var> of <var>WWᵀ</var>, and <var>R</var> is the diagonal singular-value matrix (rank <var>r</var>). If you keep <em>all</em> singular values, <span class="mono">r = min(m,n)</span> and both parameter count <em>and</em> compute <strong>increase</strong>. The win comes only from <strong>truncating</strong> small singular values.</p></div>
+
+      <h3>QSVD — low-rank Q/K/V with a shared latent <span class="tag">NeurIPS 2025</span></h3>
+      <p>Wang, Wang &amp; Zhang, "QSVD." Attention has three big projections <var>W<sub>q</sub>, W<sub>k</sub>, W<sub>v</sub></var> (each <var>E×E</var>). SVD each into down/up factors, then go further by <strong>concatenating and sharing</strong> the down-projection.</p>
+      <div class="tbl-scroll"><table>
+        <thead><tr><th>Scheme</th><th>Total MACs</th><th>Weight params</th><th>KV cache size</th></tr></thead>
+        <tbody>
+          <tr><td>Original (dense Q/K/V)</td><td><span class="mono">3LE²</span></td><td><span class="mono">3E²</span></td><td><span class="mono">2LE</span></td></tr>
+          <tr><td>Per-matrix SVD</td><td><span class="mono">6LrE</span></td><td><span class="mono">6rE</span></td><td><span class="mono">2rL</span></td></tr>
+          <tr><td><strong>QSVD (shared latent)</strong></td><td><span class="mono">4LrE</span></td><td><span class="mono">4rE</span></td><td><span class="mono">rL</span></td></tr>
+        </tbody>
+      </table></div>
+      <p>The trick is to <strong>concat and SVD together</strong>: <span class="mono">[W<sub>q</sub>,W<sub>k</sub>,W<sub>v</sub>] = W<sub>concat</sub> ≈ Wᵈ Σ Wᵘ = Wᵈ<sub>qkv</sub>·[Wᵘ<sub>q</sub>,Wᵘ<sub>k</sub>,Wᵘ<sub>v</sub>]</span>, splitting the singular values as <span class="mono">Wᵈ<sub>qkv</sub>=Wᵈ<sub>r</sub>Σ<sub>r</sub><sup>1/2</sup></span>. Now a <strong>single shared latent</strong> <span class="mono">C<sub>qkv</sub> = X·Wᵈ<sub>qkv</sub></span> is cached, and K, V are <em>reconstructed</em> from it:</p>
+      <div class="formula"><span class="eq"><var>K</var> = <var>C<sub>qkv</sub></var> <var>Wᵘ<sub>k</sub></var>,   <var>V</var> = <var>C<sub>qkv</sub></var> <var>Wᵘ<sub>v</sub></var></span><span class="lbl">cache the shared latent, not K and V</span></div>
+      <div class="call good"><span class="k">Why the KV cache halves</span><p>Instead of caching both K and V (<span class="mono">2rL</span>), you cache only the shared latent <span class="mono">C<sub>qkv</sub></span> (<span class="mono">rL</span>) and multiply by the small up-projections at read time. Same idea as Multi-head Latent Attention: <strong>store a compressed latent, expand on demand.</strong></p></div>
+
+      <h3>Assigning rank per layer</h3>
+      <p>Not every layer deserves the same rank. Score a layer's sensitivity by how much the loss moves with its singular values, then <strong>allocate a global rank budget <var>R</var> proportionally</strong>:</p>
+      <div class="formula"><span class="eq">importance = Σ<sub>i</sub> 𝔼<sub>D</sub>( |d<var>L</var>/dσ<sub>i</sub>| )</span><span class="lbl">from (L(σ+Δσ)−L(σ))/Δσ ≈ dL/dσ</span></div>
+      <p>On SmolVLM-2B, LLaVA-Next-7B and LLaVA-v1.5-13B (ScienceQA-IMG), QSVD reaches <strong>comparable or better accuracy than the original model</strong> at reduced hardware cost.</p>
+
+      <h3>The problem SVD ignores → WSVD <span class="tag">ICLR 2026</span></h3>
+      <p>Plain SVD minimizes <span class="mono">argmin<sub>W′</sub>‖W − W′‖²</span> with <span class="mono">W′=DU</span> — but it treats every weight element as equally important, which is false. <em class="term">WSVD</em> (Wang et al.) <strong>weights each element by its activation</strong>:</p>
+      <div class="formula"><span class="eq">argmin<sub>W′</sub> Σ<sub>ij</sub> ‖<var>a<sub>ij</sub></var><var>W<sub>ij</sub></var> − <var>a<sub>ij</sub></var><var>W′<sub>ij</sub></var>‖</span><span class="lbl">weighted low-rank</span></div>
+      <div class="call key"><span class="k">No closed form → learn it</span><p>Unlike plain SVD, the weighted objective has <strong>no closed-form solution</strong>, so <var>D</var> and <var>U</var> are trained with gradient descent. Element importance is estimated by a first-order expansion <span class="mono">L(w) − L(w′) ≈ (dL/dw)(w − w′)</span> — the same Taylor-importance idea used in pruning, now steering the factorization toward the weights that actually affect the loss.</p></div>
+    </section>
+
+    <hr class="rule">
+
+    <section id="recap">
+      <div class="sec-head"><span class="num">★</span><h2>Exam recap</h2></div>
+      <div class="cards">
+        <div class="card"><p class="q">Prefill vs decode</p><p>Prefill = whole prompt at once, compute-bound. Decode = one token/step, <strong>memory-bound</strong>, reads the growing KV cache.</p></div>
+        <div class="card"><p class="q">KV cache</p><p>Stores K<sub>i,j</sub>, V<sub>i,j</sub> per token per layer. Size ∝ 2·n<sub>layers</sub>·L·E·precision — grows linearly, dominates decode memory.</p></div>
+        <div class="card"><p class="q">Two outliers</p><p><strong>Massive</strong>: one huge element (A&gt;η·mean, A&gt;γ). <strong>Channelwise</strong>: whole channel, high mean / low std.</p></div>
+        <div class="card"><p class="q">Massive activations</p><p>Learned input-agnostic bias terms feeding attention. Truncating them wrecks accuracy — but the residual-carried copies can be cut.</p></div>
+        <div class="card"><p class="q">Smoothing = invariance</p><p>Scale (SmoothQuant/AWQ), rotate (QuaRot/SpinQuant), permute (DuQuant): apply T and T⁻¹ so Y=AW is unchanged but outliers flatten.</p></div>
+        <div class="card"><p class="q">QuaRot detail</p><p>Orthogonal/Hadamard R, RᵀR=I. Offline when linear; must go <strong>online</strong> when a nonlinearity follows since LN(AWR)≠LN(AW)R.</p></div>
+        <div class="card"><p class="q">Sequential &gt; parallel</p><p>Calibrate each layer on the <em>quantized</em> previous layer's output → compensates for accumulated error. Clustering beats uniform quant on outliers.</p></div>
+        <div class="card"><p class="q">Wanda</p><p>S = |W|·‖X‖₂ — input-aware pruning, per output, no weight update. Matches SparseGPT.</p></div>
+        <div class="card"><p class="q">Attention sink</p><p>StreamingLLM keeps a few initial tokens' KV + a window. Initial tokens act as a "sink" for excess attention → bounded memory.</p></div>
+        <div class="card"><p class="q">Low-rank only helps truncated</p><p>W=URVᵀ. Keep all singular values → params &amp; compute grow. Savings require truncating small σ (r ≪ min(m,n)).</p></div>
+        <div class="card"><p class="q">QSVD</p><p>Concat+SVD Q/K/V into a shared latent C<sub>qkv</sub>. Cache the latent (rL) not K&amp;V (2rL); reconstruct K=C·Wᵘ<sub>k</sub>, V=C·Wᵘ<sub>v</sub>.</p></div>
+        <div class="card"><p class="q">WSVD</p><p>Weight the SVD error by activation |a<sub>ij</sub>|. No closed form → learn D,U. Fixes SVD's "all elements equal" false assumption.</p></div>
+      </div>
+    </section>
+
+    <footer>
+      Study note compiled from <em>Lecture 07 — Efficiency Strategies for Large Language Models</em>, NYU SAI Lab, Spring 2026. Key references: Radford (CLIP) 2021 · Sun (Massive Activations) 2024 · Raman, Sharma &amp; Zhang 2025 · Xiao (SmoothQuant) 2023 · Lin (AWQ) 2024 · Ashkboos (QuaRot) 2024 · Lin (DuQuant) 2024 · Liu (SpinQuant) 2024 · Hubara (AdaQuant) 2021 · Yin (CodeQuant) 2026 · Sun (Wanda) 2023 · Ge (Adaptive KV) 2023 · Xiao (StreamingLLM) 2023 · Wang, Wang &amp; Zhang (QSVD) 2025 · Wang (WSVD) 2026.
+    </footer>
+  </main>
+</div>
+<script src="theme.js"></script>
+</body>
+</html>

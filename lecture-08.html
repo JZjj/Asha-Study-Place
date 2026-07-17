@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lecture 08: Efficient DNN Training — Study Note</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+  <nav class="toc">
+    <a class="home" href="index.html">← All lectures</a>
+    <div class="brand">08 · Efficient DNN Training</div>
+    <a href="#anatomy"><span class="n">01</span>Anatomy of training</a>
+    <a href="#compute"><span class="n">02</span>Efficient computing</a>
+    <a class="sub" href="#compute">Data &amp; parameter sampling</a>
+    <a href="#prune-quant"><span class="n">03</span>Pruning &amp; quantization</a>
+    <a class="sub" href="#prune-quant">Lottery tickets · DoReFa · BFP</a>
+    <a href="#storage"><span class="n">04</span>Efficient storage</a>
+    <a href="#peft"><span class="n">05</span>Parameter-efficient finetuning</a>
+    <a class="sub" href="#peft">Adapter · BitFit · LoRA</a>
+    <a href="#specdec"><span class="n">06</span>Speculative decoding</a>
+    <a href="#recap"><span class="n">★</span>Exam recap</a>
+  </nav>
+
+  <main>
+    <header class="mast">
+      <p class="eyebrow">Lecture 08 · Study Note</p>
+      <h1>Efficient DNN Training, PEFT &amp; Speculative Decoding</h1>
+      <p class="sub">Three ways to spend less: train the model more cheaply (less compute, less memory), adapt a giant model by touching only a sliver of its weights, and decode faster at inference by letting a small model guess ahead. The math of forward/backward passes ties it all together.</p>
+      <div class="meta-row">
+        <span class="chip">NYU SAI Lab</span>
+        <span class="chip">Spring 2026</span>
+        <span class="chip">Training · Finetuning · Inference</span>
+        <span class="chip">LoRA · BFP · Spec-decode</span>
+      </div>
+    </header>
+
+    <section id="anatomy">
+      <div class="sec-head"><span class="num">01</span><h2>The anatomy of training: forward, backward, memory</h2></div>
+      <p class="lede">Every efficiency trick in this lecture attacks one of three quantities: the <strong>compute</strong> of the two backward matmuls, the <strong>memory</strong> held to enable them, or the <strong>parameters</strong> that get updated. Start by knowing exactly what training does.</p>
+
+      <h3>Forward pass of a linear layer</h3>
+      <p>A fully-connected layer during forward propagation is just a matrix multiply. With batch <var>B</var>, input channels <var>C<sub>in</sub></var>, output channels <var>C<sub>out</sub></var>:</p>
+      <div class="formula"><span class="eq"><var>Y</var> = <var>X</var> · <var>W</var></span><span class="lbl">(B×C<sub>in</sub>) · (C<sub>in</sub>×C<sub>out</sub>) = (B×C<sub>out</sub>)</span></div>
+      <p>A convolution collapses to the same shape once you im2col it. Assuming a 1×1 kernel, the <em class="term">matrix view</em> of a conv layer is <span class="mono">X(BHW×C) · W(C×N) = Y(BHW×N)</span> — the batch-and-spatial dimensions are flattened into the rows.</p>
+
+      <h3>Backward pass: two matmuls, not one</h3>
+      <p>Backprop through a linear layer costs <strong>two</strong> matrix multiplications — this is the single most important fact for reasoning about training cost.</p>
+      <div class="formula"><span class="eq"><var>∇W</var> = <var>X</var><sup>T</sup> · <var>∇Y</var></span><span class="lbl">weight gradient · (C<sub>in</sub>×B)·(B×C<sub>out</sub>)</span></div>
+      <div class="formula"><span class="eq"><var>∇X</var> = <var>∇Y</var> · <var>W</var><sup>T</sup></span><span class="lbl">data gradient · (B×C<sub>out</sub>)·(C<sub>out</sub>×C<sub>in</sub>)</span></div>
+      <div class="call key"><span class="k">Why this matters</span><p>The <strong>weight gradient</strong> <var>∇W</var> needs the saved input <var>X</var>; the <strong>data gradient</strong> <var>∇X</var> propagates the error to the previous layer and needs <var>W</var>. Because <var>∇W</var> consumes <var>X</var>, the forward activations of <em>every</em> layer must be kept alive until the backward pass reaches them — this is the root cause of activation memory blowup (§4).</p></div>
+      <p>The activation gradient also flows back through the nonlinearity (e.g. <span class="mono">dReLU/dx</span> gates <var>∇Y</var>), and then the optimizer applies the update:</p>
+      <div class="formula"><span class="eq"><var>W′</var> = <var>W</var> − η · <var>∇W</var></span><span class="lbl">SGD weight update</span></div>
+
+      <h3>The training loop in three calls</h3>
+      <ul class="clean">
+        <li><strong><span class="mono">forward()</span></strong> — run input up to the loss, caching activations.</li>
+        <li><strong><span class="mono">loss.backward()</span></strong> — propagate gradients down, layer by layer.</li>
+        <li><strong><span class="mono">optimizer.step()</span></strong> — apply a weight update at every layer.</li>
+      </ul>
+      <div class="call key"><span class="k">Two axes of efficiency</span><p>The lecture splits training efficiency into <strong>efficient computing</strong> (do fewer / cheaper operations — §2, §3) and <strong>efficient storage</strong> (hold less in memory — §4). Keep them separate; a method can help one and hurt the other.</p></div>
+    </section>
+
+    <hr class="rule">
+
+    <section id="compute">
+      <div class="sec-head"><span class="num">02</span><h2>Efficient computing: sampling the data and the network</h2></div>
+      <p class="lede">Four dimensions reduce the compute of training: <strong>training-data sampling</strong>, <strong>parameter sampling</strong>, <strong>pruning during training</strong>, and <strong>quantization during training</strong>. This section covers the first two; §3 covers the rest.</p>
+
+      <h3>Training-data sampling <span class="tag">Select-via-Proxy</span></h3>
+      <p>Not every sample is worth a full gradient step. To pick a budget of <var>b</var> samples, work in <var>K</var> rounds, adding <span class="mono">b/K</span> points per round:</p>
+      <ul class="clean">
+        <li>Train the target model on the current <span class="mono">b/K</span> subset.</li>
+        <li>Evaluate the model on the <em>remaining</em> pool.</li>
+        <li>Append the batch with the <strong>least confidence score</strong> (the hardest / most informative points) to the training set. Repeat.</li>
+      </ul>
+      <p>In the toy example, Round 1 scores four samples <span class="mono">(0.99, 0.11, 0.27, 0.97)</span>; the two the model is already confident about (<var>x₁</var>, <var>x₄</var>) are dropped, and Round 2 keeps only the uncertain <var>x₂</var>, <var>x₃</var>. <a class="cite" href="#refs">Coleman et al. 2019</a>.</p>
+
+      <h3>Parameter sampling — skip work stochastically</h3>
+      <p><em class="term">E2-Train</em> attacks training energy from three levels at once: <strong>Data-level (SMD)</strong>, <strong>Model-level (SLU)</strong>, and <strong>Algorithm-level (PSG)</strong>.</p>
+      <div class="call good"><span class="k">Stochastic Mini-batch Dropping (SMD)</span><p>Simply <strong>skip every mini-batch with probability 0.5</strong> by default. On easy datasets this has negligible impact on final accuracy while roughly halving the batches processed — <a class="cite" href="#refs">Wang et al. 2019</a> report over 80% energy savings.</p></div>
+
+      <h3>Dynamically skipping layers <span class="tag">SkipNet</span></h3>
+      <p>Instead of a fixed network, attach a lightweight <strong>gating function</strong> to each residual block that decides, per input, whether to execute or skip it:</p>
+      <div class="formula"><span class="eq"><var>G<sub>i</sub></var>(<var>x<sub>i</sub></var>) ∈ {0, 1}</span><span class="lbl">gate for layer i</span></div>
+      <ul class="clean">
+        <li>The gates <var>G</var> and the residual blocks are <strong>trained together</strong>.</li>
+        <li>The training objective adds a compute penalty: <span class="mono">Loss = acc_loss + computation_loss</span>.</li>
+        <li>Result: the network <strong>adapts its depth per input</strong> — easy images take a short path, hard ones the full stack. <a class="cite" href="#refs">Wang et al. (SkipNet) 2018</a>.</li>
+      </ul>
+    </section>
+
+    <hr class="rule">
+
+    <section id="prune-quant">
+      <div class="sec-head"><span class="num">03</span><h2>Pruning and quantization <em>during</em> training</h2></div>
+      <p class="lede">The other two computing dimensions change the network itself as it trains: zero out weights early (pruning) or shrink the numeric precision of the whole pipeline (quantization).</p>
+
+      <h3>Finding the winning ticket <span class="tag">IMP + rewind</span></h3>
+      <p>The Lottery Ticket Hypothesis says a dense net hides a small trainable subnetwork. <em class="term">Iterative Magnitude Pruning</em> finds it:</p>
+      <ul class="clean">
+        <li>Initialize the DNN with random weights <span class="mono">w₀</span>.</li>
+        <li>While the sparsity target is not met: train <var>k</var> epochs to convergence → prune <var>p%</var> of the nonzero weights → <strong>rewind</strong> survivors back to their <span class="mono">w₀</span> values and finetune <var>k</var> more epochs.</li>
+        <li>For larger networks, rewinding to an <em>early</em> checkpoint <span class="mono">wᵢ</span> (small <var>i</var>) works better than all the way to <span class="mono">w₀</span>. <a class="cite" href="#refs">Frankle et al. 2019</a>.</li>
+      </ul>
+      <div class="call key"><span class="k">Pruning as architecture search · Liu et al. 2018</span><p>"Rethinking the Value of Network Pruning" argues the <strong>discovered architecture</strong>, not the inherited "important" weights, is what drives final accuracy — so pruning can be read as a form of neural architecture search.</p></div>
+
+      <h3>Early-bird tickets <span class="tag">stop early</span></h3>
+      <p>Winning tickets can be drawn <strong>very early</strong> in training with cheap schemes (early stopping, low-precision, large learning rates). The algorithm tracks the <strong>mask distance</strong> between successive pruned subnetworks in a FIFO queue; when <span class="mono">Max(Q) &lt; ε</span> the mask pattern has <strong>stabilized</strong>, so training stops and returns the ticket. <a class="cite" href="#refs">You et al. 2019</a> find EB tickets after only 6–20% of training.</p>
+      <div class="call good"><span class="k">Pruning the gradient itself · SDGP</span><p>Structured Data Gradient Pruning applies <strong>2:4 sparsity to the data gradient</strong> <span class="mono">dL/dO · Wᵀ = dL/dI</span> during backprop — accelerating training, not just inference. <a class="cite" href="#refs">McDanel et al. 2022</a>.</p></div>
+
+      <h3>Low-precision training <span class="tag">DoReFa-Net</span></h3>
+      <p>DoReFa-Net trains with low-bitwidth weights (W), activations (A), <em>and</em> gradients (G):</p>
+      <ul class="clean">
+        <li><strong>Linearly quantize</strong> the weights and activations.</li>
+        <li>Apply <strong>stochastic quantization</strong> to the gradients — gradients need far more bitwidth than weights or activations, so a deterministic round would introduce bias.</li>
+      </ul>
+      <div class="tbl-scroll"><table>
+        <thead><tr><th>W</th><th>A</th><th>G</th><th>AlexNet acc.</th><th>Note</th></tr></thead>
+        <tbody>
+          <tr><td>1</td><td>1</td><td>32</td><td>0.279</td><td>BNN</td></tr>
+          <tr><td>1</td><td>1</td><td>32</td><td>0.442</td><td>XNOR-Net</td></tr>
+          <tr><td>1</td><td>2</td><td>6</td><td>0.461</td><td>low G still works</td></tr>
+          <tr><td>1</td><td>4</td><td>32</td><td>0.503</td><td>more A helps</td></tr>
+          <tr><td>8</td><td>8</td><td>8</td><td>0.530</td><td>8-bit everywhere</td></tr>
+          <tr><td>32</td><td>32</td><td>32</td><td>0.559</td><td>full FP32 baseline</td></tr>
+        </tbody>
+      </table></div>
+      <p style="font-size:13px;color:var(--muted)"><a class="cite" href="#refs">Zhou et al. 2016</a>. Gradient (G) bitwidth is the last thing you can safely shrink.</p>
+
+      <h3>Why stochastic quantization</h3>
+      <p>Suppose you must quantize <var>a</var> = 0.2 to the grid {0, 1}. Deterministic linear quantization gives <span class="mono">q(a) = 0</span> — always — introducing a systematic <strong>bias</strong>. Stochastic quantization instead rounds probabilistically so it is <em>unbiased in expectation</em>:</p>
+      <div class="formula"><span class="eq"><var>q</var>(<var>a</var>) = 1 with p = 0.2 ,  0 with p = 0.8</span><span class="lbl">𝔼[q(a)] = 0.2 = a</span></div>
+
+      <h3>Hybrid Block Floating Point <span class="tag">BFP</span></h3>
+      <p>Standard FP stores an exponent per element; <em class="term">Block Floating Point</em> shares <strong>one exponent per tensor (tile)</strong> and keeps only the mantissas per element — far cheaper in hardware with comparable representational power.</p>
+      <ul class="clean">
+        <li>Use BFP for all <strong>dot-product operations</strong> (convolutions, matmuls, outer products); keep FP for activations, regularizers, etc.</li>
+        <li>Store weights with <strong>wider mantissas</strong> to avoid data loss over a long training run.</li>
+        <li>ResNet-50 / ImageNet, 90 epochs: 8-bit mantissa + 16-bit weight (<span class="mono">hbfp8_16</span>) matches FP32; a 12-bit mantissa does even better. Tile size 24. <a class="cite" href="#refs">Drumond et al. 2018</a>.</li>
+      </ul>
+      <div class="call key"><span class="k">Two copies of the weights</span><p>Forward and gradient computation run in <strong>BFP</strong>, but the <strong>weight update runs in FP</strong> (e.g. FP32). So two copies live in memory: a low-precision copy for matmuls and a high-precision master copy that accumulates tiny updates. The quantizer <span class="mono">Q</span> bridges them each step.</p></div>
+      <p>Because the compute matmuls dominate cost, quantizing them buys most of the speedup; keeping the master weights in FP preserves accuracy. <em class="term">Neural gradients are near-lognormal</em> — one can fit a lognormal to the gradient distribution to pick the optimal bitwidth and quantization interval. <a class="cite" href="#refs">Chmiel et al. 2020</a>.</p>
+    </section>
+
+    <hr class="rule">
+
+    <section id="storage">
+      <div class="sec-head"><span class="num">04</span><h2>Efficient storage: taming activation memory</h2></div>
+      <p class="lede">Training memory is dominated not by weights but by <strong>activations</strong> — the tensors cached in the forward pass so the backward pass can compute <var>∇W</var> (recall §1).</p>
+
+      <h3>Where the memory goes</h3>
+      <ul class="clean">
+        <li>The footprint <strong>grows with layer depth</strong>: early-layer activations must be held for a long time, all the way until the backward pass reaches them.</li>
+        <li>Activations consume <strong>~13× more memory than weights on average</strong> (batch size 48). VGG-16 stores <span class="mono">13.4×</span> the ResNet-18 activation baseline; weights are a thin sliver of each bar.</li>
+      </ul>
+      <div class="call warn"><span class="k">The asymmetry</span><p>Because activations dwarf weights during training, reducing <em>parameter</em> count (pruning, quantization) barely dents peak training memory. The lever that matters is <strong>not holding all activations at once</strong>.</p></div>
+
+      <h3>Block-wise local learning <span class="tag">BIM</span></h3>
+      <p>Conventional masked-image modeling does one global forward then one global backward, so <strong>every</strong> block's activations must coexist in memory. <em class="term">BIM</em> introduces a <strong>local loss</strong> per block:</p>
+      <ul class="clean">
+        <li>Each encoder block <var>i</var> is paired with a decoder block <var>i</var> and trained with its own local objective.</li>
+        <li>Once the parameter updates for block <var>i</var> finish, all buffered intermediate features <strong>except <var>xᵢ</var> can be cleared</strong> from memory and reused.</li>
+        <li>Net effect: peak memory tracks a <em>single block</em> rather than the whole network's forward pass. <a class="cite" href="#refs">Luo et al. 2023</a>.</li>
+      </ul>
+    </section>
+
+    <hr class="rule">
+
+    <section id="peft">
+      <div class="sec-head"><span class="num">05</span><h2>Parameter-efficient finetuning (PEFT)</h2></div>
+      <p class="lede">Large models have billions of parameters; fully finetuning one per downstream task is wasteful. <strong>PEFT</strong> updates only a tiny slice of weights and still reaches near-full-finetune accuracy. Three canonical methods: Adapter, BitFit, LoRA.</p>
+
+      <h3>Adapter <span class="tag">bottleneck module</span></h3>
+      <p>Insert a small trainable module <strong>twice</strong> into each transformer layer (after attention, after the feed-forward). Each adapter is a bottleneck — <em>down-project → nonlinearity → up-project</em> — with a skip connection.</p>
+      <ul class="clean">
+        <li>Only the adapters are trained; the backbone is frozen.</li>
+        <li>Learnable parameters are just <strong>0.5–8%</strong> of the original model. <a class="cite" href="#refs">Houlsby et al. 2019</a>.</li>
+      </ul>
+
+      <h3>BitFit <span class="tag">bias-only</span></h3>
+      <p>Even cheaper: freeze everything and finetune <strong>only the bias terms</strong> (in Q/K/V, the MLP, and layer norms). On BERT this is competitive with — sometimes better than — full finetuning, while touching only <strong>0.09%</strong> of parameters. <a class="cite" href="#refs">Zaken et al. 2021</a>.</p>
+      <div class="call good"><span class="k">Why bias finetuning is cheap · TinyTL insight</span><p>The bias gradient is just a sum of the output gradient: <span class="mono">dL/dβ = Σ<sub>y∈Y</sub> dL/dy</span>. It <strong>does not depend on the input activations</strong>, so updating the bias requires <em>no buffering of intermediate results</em> during the forward pass — a large activation-memory saving on-device. <a class="cite" href="#refs">Cai et al. (TinyTL) 2020</a>.</p></div>
+
+      <h3>Low-Rank Adaptation <span class="tag">LoRA</span></h3>
+      <p>Freeze the pretrained weight <var>W₀</var> and learn a <strong>low-rank update</strong> parameterized as a product of two thin matrices:</p>
+      <div class="formula"><span class="eq"><var>h</var> = <var>W₀</var><var>x</var> + Δ<var>W</var><var>x</var> = <var>W₀</var><var>x</var> + <var>B</var><var>A</var><var>x</var></span><span class="lbl">only A, B are trained</span></div>
+      <ul class="clean">
+        <li>For a weight of size <var>E×E</var>, take <var>A</var> as <var>E×r</var> and <var>B</var> as <var>r×E</var>, with <strong>r ≪ E</strong> (e.g. r = 4). LoRA is usually inserted into the attention projections Q/K/V.</li>
+        <li>At inference <var>BA</var> can be <strong>merged into <var>W₀</var></strong> → <em>zero</em> extra compute or storage cost, unlike Adapter.</li>
+      </ul>
+      <div class="call key"><span class="k">The compute saving</span><p>Finetuning the full Q/K/V costs <span class="mono">3BLE²</span> per block. LoRA replaces that with a rank-<var>r</var> path costing only <span class="mono">6BLrE</span> — since <var>r</var> ≪ <var>E</var>, the second is dramatically smaller. You never form the full <var>E×E</var> gradient.</p></div>
+      <div class="tbl-scroll"><table>
+        <thead><tr><th>Model &amp; Method</th><th># Trainable</th><th>MNLI</th><th>SST-2</th><th>Avg.</th></tr></thead>
+        <tbody>
+          <tr><td>RoB<sub>base</sub> (full FT)</td><td>125.0M</td><td>87.6</td><td>94.8</td><td>86.4</td></tr>
+          <tr><td>RoB<sub>base</sub> (BitFit)</td><td>0.1M</td><td>84.7</td><td>93.7</td><td>85.2</td></tr>
+          <tr><td>RoB<sub>base</sub> (Adapter)</td><td>0.3M</td><td>87.1</td><td>94.2</td><td>84.4</td></tr>
+          <tr><td><strong>RoB<sub>base</sub> (LoRA)</strong></td><td>0.3M</td><td>87.5</td><td>95.1</td><td><strong>87.2</strong></td></tr>
+          <tr><td>DeB<sub>XXL</sub> (full FT)</td><td>1500.0M</td><td>91.8</td><td>97.2</td><td>91.1</td></tr>
+          <tr><td><strong>DeB<sub>XXL</sub> (LoRA)</strong></td><td>4.7M</td><td>91.9</td><td>96.9</td><td><strong>91.3</strong></td></tr>
+        </tbody>
+      </table></div>
+      <p style="font-size:13px;color:var(--muted)">LoRA matches or beats Adapter and BitFit while training &lt;0.5% of the parameters. <a class="cite" href="#refs">Hu et al. 2021</a>.</p>
+    </section>
+
+    <hr class="rule">
+
+    <section id="specdec">
+      <div class="sec-head"><span class="num">06</span><h2>Speculative decoding</h2></div>
+      <p class="lede">Autoregressive decoding is serial: <var>N</var> tokens cost <var>N</var> forward passes. A large model is <strong>accurate but slow</strong> (<var>T</var><sub>tot</sub> = <var>N·T₁</var>); a small one is <strong>fast but inaccurate</strong> (<var>N·T₂</var>). Speculative decoding gets the large model's quality at closer to the small model's speed — <em>losslessly</em>.</p>
+
+      <h3>Draft, then verify</h3>
+      <ul class="clean">
+        <li>A cheap <strong>draft model</strong> autoregressively proposes several tokens ahead (cost <span class="mono">N·T₂</span>).</li>
+        <li>The <strong>target model</strong> verifies the whole draft in a <em>single</em> parallel forward pass (cost <span class="mono">T<sub>val</sub></span>), accepting the longest correct prefix.</li>
+      </ul>
+      <div class="formula"><span class="eq"><var>T</var><sub>tot</sub> = <var>N·T₂</var> + <var>T</var><sub>val</sub> &lt; <var>N·T₁</var></span><span class="lbl">speculative &lt; autoregressive</span></div>
+      <ul class="clean">
+        <li>If a draft token is <strong>wrong</strong>, the target supplies the correct token, and the draft resumes from there — output is identical to running the target alone (lossless). <a class="cite" href="#refs">Leviathan et al. 2023</a>.</li>
+        <li><strong>Caveat:</strong> if too few draft tokens pass verification, speculative decoding can be <em>slower</em> than the plain autoregressive baseline. Acceptance rate is everything.</li>
+      </ul>
+
+      <h3>Variants</h3>
+      <div class="cards">
+        <div class="card"><p class="q">Self-Speculative</p><p>The draft is a <strong>subnetwork</strong> of the target (early-exit layers). Intermediate results are reusable; only a small classification head is trained. <a class="cite" href="#refs">Zhang 2023 · LayerSkip 2024</a></p></div>
+        <div class="card"><p class="q">SpecInfer</p><p><strong>Tree-based</strong> speculation: propose a tree of candidate continuations and verify them jointly, raising the accepted-token count per step. <a class="cite" href="#refs">Miao 2023</a></p></div>
+        <div class="card"><p class="q">PEARL</p><p><strong>Parallel</strong> spec-decoding with pre-verify + post-verify for <em>adaptive draft length</em>; the draft keeps decoding during verification. On failure the window shrinks to 1. <a class="cite" href="#refs">Liu 2024</a></p></div>
+        <div class="card"><p class="q">DREAM</p><p><strong>Multimodal</strong> spec-decoding: the target streams intermediate features to the draft to guide it, and prunes redundant visual tokens to cut draft latency. <a class="cite" href="#refs">Hu 2025</a></p></div>
+      </div>
+
+      <h3>Training the draft for a better acceptance rate</h3>
+      <p>The draft model can be finetuned on the target's data with a cross-entropy loss <span class="mono">ℒ<sub>CE</sub></span> — often using <strong>LoRA</strong> on its Q/K/V — so its distribution better matches the target and more tokens pass verification. This closes the loop with §5.</p>
+      <div class="call key"><span class="k">The unifying idea</span><p>An ideal draft model needs a <strong>high acceptance rate</strong> and <strong>low execution latency</strong> — which is <em>exactly</em> the goal of DNN pruning, quantization, knowledge distillation, and dynamic computing. Speculative decoding turns every model-compression technique in this course into a latency win at inference.</p></div>
+    </section>
+
+    <hr class="rule">
+
+    <section id="recap">
+      <div class="sec-head"><span class="num">★</span><h2>Exam recap</h2></div>
+      <div class="cards">
+        <div class="card"><p class="q">Backward = 2 matmuls</p><p>∇W = Xᵀ·∇Y (needs saved X), ∇X = ∇Y·Wᵀ. Caching X for ∇W is why activations dominate memory.</p></div>
+        <div class="card"><p class="q">Two efficiency axes</p><p>Efficient <strong>computing</strong> (data sampling, parameter sampling, pruning, quantization) vs efficient <strong>storage</strong> (activation memory).</p></div>
+        <div class="card"><p class="q">Data / parameter sampling</p><p>Select-via-proxy keeps least-confident samples. E2-Train drops mini-batches (p=0.5); SkipNet gates layers per input.</p></div>
+        <div class="card"><p class="q">Lottery tickets</p><p>IMP: train → prune p% → rewind survivors to w₀ (or early wᵢ). Early-bird tickets: stop once mask distance stabilizes.</p></div>
+        <div class="card"><p class="q">Low-precision training</p><p>DoReFa quantizes W/A linearly, gradients stochastically (unbiased: q(0.2)=1 w.p. 0.2). Gradients need the most bits.</p></div>
+        <div class="card"><p class="q">BFP + two copies</p><p>One exponent per tile. Matmuls in BFP, weight update in FP — a low-precision copy plus an FP master copy.</p></div>
+        <div class="card"><p class="q">PEFT trio</p><p>Adapter (0.5–8%, bottleneck) · BitFit (0.09%, bias-only, no activation buffering) · LoRA (h=W₀x+BAx, r≪E, mergeable).</p></div>
+        <div class="card"><p class="q">Speculative decoding</p><p>Draft proposes, target verifies in one pass: T=NT₂+T_val&lt;NT₁, lossless. Low acceptance can be slower than baseline.</p></div>
+      </div>
+    </section>
+
+    <footer id="refs">
+      Study note compiled from <em>Lecture 08 — Efficient DNN Training, Parameter Efficient Finetuning, Speculative Decoding</em>, NYU SAI Lab, Spring 2026. Key references: Coleman 2019 (Select-via-Proxy) · Wang (E2-Train) 2019 · Wang (SkipNet) 2018 · Frankle 2019 · Liu 2018 · You 2019 (Early-bird) · McDanel 2022 (SDGP) · Zhou 2016 (DoReFa-Net) · Drumond 2018 (Hybrid BFP) · Chmiel 2020 · Luo 2023 (BIM) · Houlsby 2019 (Adapter) · Zaken 2021 (BitFit) · Cai 2020 (TinyTL) · Hu 2021 (LoRA) · Leviathan 2023 · Zhang 2023 · Elhoushi 2024 (LayerSkip) · Miao 2023 (SpecInfer) · Liu 2024 (PEARL) · Hu 2025 (DREAM).
+    </footer>
+  </main>
+</div>
+<script src="theme.js"></script>
+</body>
+</html>

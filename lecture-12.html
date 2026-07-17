@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lecture 12: Training Accelerators — Study Note</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+  <nav class="toc">
+    <a class="home" href="index.html">← All lectures</a>
+    <div class="brand">12 · Training Accelerators</div>
+    <a href="#landscape"><span class="n">01</span>The training workload</a>
+    <a class="sub" href="#landscape">Self-attention · cost breakdown</a>
+    <a href="#nonmatmul"><span class="n">02</span>Non-matmul hardware</a>
+    <a class="sub" href="#nonmatmul">Transposition · softmax · LayerNorm</a>
+    <a class="sub" href="#nonmatmul">HAAN · PICACHU</a>
+    <a href="#backprop"><span class="n">03</span>Backward-pass hardware</a>
+    <a class="sub" href="#backprop">Transposed matmul · systolic dataflow</a>
+    <a href="#precision"><span class="n">04</span>Reduced-precision training</a>
+    <a class="sub" href="#precision">BFP · FAST</a>
+    <a href="#memory"><span class="n">05</span>Memory-efficient training</a>
+    <a class="sub" href="#memory">RevNet · Duplex · CAMEL</a>
+    <a href="#recap"><span class="n">★</span>Exam recap</a>
+  </nav>
+
+  <main>
+    <header class="mast">
+      <p class="eyebrow">Lecture 12 · Study Note</p>
+      <h1>Transformer &amp; DNN Training Accelerators</h1>
+      <p class="sub">Training is not just a bigger forward pass. It adds a <strong>backward pass</strong>, <strong>transposed matmuls</strong>, <strong>nonlinear operations</strong> the systolic array can't do, and a huge <strong>activation memory</strong> bill. This note walks through the hardware that attacks each of these.</p>
+      <div class="meta-row">
+        <span class="chip">NYU SAI Lab</span>
+        <span class="chip">Spring 2026</span>
+        <span class="chip">Systolic arrays · BFP</span>
+        <span class="chip">backprop · softmax · LayerNorm</span>
+      </div>
+    </header>
+
+    <section id="landscape">
+      <div class="sec-head"><span class="num">01</span><h2>The training workload: it isn't all matmul</h2></div>
+      <p class="lede">A trained accelerator has to do three things inference never asked of it: run the <strong>backward pass</strong>, feed <strong>nonlinear</strong> and <strong>transposition</strong> operators, and hold the <strong>activations</strong> alive until the gradients arrive. Start by seeing where the time actually goes.</p>
+
+      <h3>The self-attention block <span class="tag">forward recap</span></h3>
+      <p>With batch <var>B</var>, sequence <var>L</var>, embedding <var>E</var>. From each input token, three vectors — Query <var>Q</var>, Key <var>K</var>, Value <var>V</var> — are produced by linear projections, then scores are formed, softmaxed, and applied to the values:</p>
+      <div class="formula"><span class="eq">Q,K,V: (<var>B</var>,<var>L</var>,<var>E</var>) × (<var>E</var>,<var>E</var>) → (<var>B</var>,<var>L</var>,<var>E</var>)</span><span class="lbl">three linear projections</span></div>
+      <div class="formula"><span class="eq">QKᵀ: (<var>B</var>,<var>L</var>,<var>E</var>) × (<var>B</var>,<var>E</var>,<var>L</var>) → (<var>B</var>,<var>L</var>,<var>L</var>)</span><span class="lbl">pairwise scores</span></div>
+      <div class="formula"><span class="eq">softmax(QKᵀ)·V: (<var>B</var>,<var>L</var>,<var>L</var>) × (<var>B</var>,<var>L</var>,<var>E</var>) → (<var>B</var>,<var>L</var>,<var>E</var>)</span><span class="lbl">scale → softmax → context</span></div>
+      <p>Scale, softmax-normalize, multiply the values, pass through the output linear, and add the residual. Notice the non-matmul steps sprinkled through: a <strong>transpose</strong> to form <var>Kᵀ</var>, a <strong>softmax</strong>, and (per block) two <strong>LayerNorms</strong>.</p>
+
+      <h3>Where does the latency go?</h3>
+      <p>Measured latency breakdown on two LLMs — matmul dominates but is far from the whole story:</p>
+      <div class="tbl-scroll"><table>
+        <thead><tr><th>Model</th><th>Matmul</th><th>Normalization</th><th>Softmax</th><th>Others (e.g. transpose)</th></tr></thead>
+        <tbody>
+          <tr><td><strong>GPT-2</strong></td><td>52.2%</td><td>16.1%</td><td>13.9%</td><td>17.8%</td></tr>
+          <tr><td><strong>OPT</strong></td><td>57.2%</td><td>14.9%</td><td>13.4%</td><td>14.5%</td></tr>
+        </tbody>
+      </table></div>
+      <div class="call key"><span class="k">Why this matters for hardware</span><p>Matmul is the majority, but the <strong>nonlinear operations are not negligible</strong> — normalization + softmax + "others" together are ~45%. A systolic array only speeds up the matmul; if the LayerNorm, softmax, and transposes run slowly on a general core, they become the bottleneck by <em class="term">Amdahl's law</em>. Hence Part 2: give the non-matmul ops their own hardware.</p></div>
+
+      <h3>Tiling the matmul</h3>
+      <p>Large operands don't fit the compute core, so they are <strong>partitioned into tiles</strong> sized to the array (e.g. a 512×256 · 256×256 product broken into 128×128 tiles <var>A</var><sub>00</sub>, <var>B</var><sub>00</sub>, …). Each tile pair is one systolic-array pass; results accumulate across the shared dimension.</p>
+    </section>
+
+    <hr class="rule">
+
+    <section id="nonmatmul">
+      <div class="sec-head"><span class="num">02</span><h2>Hardware for operations other than matmul</h2></div>
+      <p class="lede">Everything the matmul engine can't do: <strong>transposition</strong>, <strong>softmax</strong>, <strong>division</strong>, <strong>LayerNorm</strong>, <strong>GeLU</strong>. The recurring trick is to turn expensive operators (exp, reciprocal, √) into <strong>shifts and adds</strong> in the log domain, or to skip them entirely.</p>
+
+      <h3>In-place matrix transposition</h3>
+      <p>Transpose a matrix <em>within its existing memory</em>, using only minimal extra storage. A row-major array <span class="mono">a b c d e f g h</span> (2×4) must become the column-major order <span class="mono">a e b f c g d h</span> (4×2). The elements move in <em class="term">permutation cycles</em>:</p>
+      <div class="formula"><span class="eq">(b,c,e) → (e,b,c)   ·   (d,f,g) → (f,g,d)</span><span class="lbl">a and h are fixed points</span></div>
+      <ul class="clean">
+        <li>Logic must <strong>read multiple entries, permute them, and write them back</strong> — done efficiently with minimal memory-access cost.</li>
+        <li>Finding the swapping pattern that <strong>minimizes permutations</strong> is a classic math problem — <em class="term">Brenner, Algorithm 467</em> (ACM TOMS, 1973).</li>
+      </ul>
+
+      <h3>Softmax <span class="tag">exp via shift-add</span></h3>
+      <p>Softmax is everywhere in transformers. The costly parts are the <strong>exponential</strong> and the <strong>division</strong>:</p>
+      <div class="formula"><span class="eq"><var>s<sub>i</sub></var> = e<sup><var>z<sub>i</sub></var></sup> / Σ<sub><var>j</var>=0</sub><sup><var>N</var>−1</sup> e<sup><var>z<sub>j</sub></var></sup></span><span class="lbl">for i = 1…N</span></div>
+      <p>Rewrite the exponential in base 2 so it becomes a shift-and-multiply. For positive <var>z</var> in INT representation:</p>
+      <div class="formula"><span class="eq">e<sup><var>z</var></sup> = 2<sup><var>z</var>·log₂e</sup> = 2<sup><var>u</var>+<var>v</var></sup> ,   log₂e ≈ 1.0111₂</span><span class="lbl">change of base</span></div>
+      <div class="formula"><span class="eq"><var>z</var>·log₂e ≈ <var>z</var> + (<var>z</var>&gt;&gt;2) + (<var>z</var>&gt;&gt;3) + (<var>z</var>&gt;&gt;4)</span><span class="lbl">multiply-by-constant → shifts</span></div>
+      <div class="formula"><span class="eq">e<sup><var>z</var></sup> = 2<sup><var>u</var>+<var>v</var></sup> ≈ 2<sup><var>u</var></sup>·(1 + <var>v</var>/2)</span><span class="lbl">u = exponent, v/2 = mantissa</span></div>
+      <div class="call key"><span class="k">The pattern</span><p><var>u</var> is the <strong>integer part</strong> of the exponent (becomes a bit-shift) and <var>v</var> is the <strong>fractional part</strong>; <span class="mono">v/2</span> serves as the mantissa. So <span class="mono">2<sup>u</sup>(1+v/2)</span> is a shift plus one small multiply — <strong>no exp unit needed</strong>. This is the <em class="term">Taylor approximation</em> <span class="mono">2<sup>v</sup> ≈ 1 + v/2</span> for small <var>v</var> (Xia &amp; Zhang, "Softmax Acceleration," 2023).</p></div>
+
+      <h3>Division <span class="tag">reciprocal in log domain</span></h3>
+      <p>Floating-point division collapses to <strong>add/subtract in the log domain</strong>, again using <span class="mono">log₂(1+m) ≈ m</span>:</p>
+      <div class="formula"><span class="eq">a/b = 2<sup><var>e<sub>a</sub></var></sup>(1+<var>m<sub>a</sub></var>) / 2<sup><var>e<sub>b</sub></var></sup>(1+<var>m<sub>b</sub></var>) ≈ 2<sup><var>e<sub>a</sub></var>−<var>e<sub>b</sub></var>+<var>m<sub>a</sub></var>−<var>m<sub>b</sub></var></sup></span><span class="lbl">FP division → subtract exponents</span></div>
+      <p>For INT operands, a conventional <strong>hardware divisor</strong> (accumulator + <var>n</var>+1-bit adder + shift-left quotient logic) is used instead.</p>
+
+      <h3>LayerNorm <span class="tag">inverse √ via log</span></h3>
+      <p>Normalization needs a mean, a variance, and — the costly bit — the <strong>inverse of the standard deviation</strong>:</p>
+      <div class="formula"><span class="eq"><var>s</var> = α·(<var>z</var>−μ<sub><var>z</var></sub>)/σ<sub><var>z</var></sub> + β</span><span class="lbl">μ<sub>z</sub> = Σz<sub>i</sub>/N ,  σ<sub>z</sub> = √(Σ(z<sub>i</sub>−μ<sub>z</sub>)²/N)</span></div>
+      <p>The reciprocal square root is again a log-domain trick — halve the log and negate:</p>
+      <div class="formula"><span class="eq"><var>y</var> = 1/√<var>x</var>  ⇒  log₂<var>y</var> = −½·log₂<var>x</var></span><span class="lbl">with log₂x ≈ E<sub>x</sub> − Q + M<sub>x</sub>/2<sup>L</sup> + σ<sub>x</sub></span></div>
+      <p style="font-size:13px;color:var(--muted)"><var>Q</var> is the bias; <var>E<sub>x</sub></var>, <var>M<sub>x</sub></var> are the binary exponent and mantissa. For functions too complex for these tricks (e.g. GeLU), fall back to a <strong>table lookup</strong> <span class="mono">y = F(x)</span> — precompute and store results — at the cost of extra memory access and footprint.</p>
+
+      <h3>HAAN: skipping LayerNorm work <span class="tag">accelerator</span></h3>
+      <p>HAAN exploits a measured fact: the <strong>inverse standard deviation (ISD)</strong> of the input is <strong>correlated across layers</strong> — in deep blocks it becomes nearly linear in log scale.</p>
+      <ul class="clean">
+        <li><strong>Exploit correlation</strong> in input statistics across layers → <strong>skip redundant computation</strong> and <em>estimate</em> the normalization statistics with a lightweight <strong>log-linear predictor</strong>.</li>
+        <li>Datapath: <strong>Input Statistics Calculator</strong> (parallel mean/variance) → <strong>Square Root Inverter</strong> (Newton's method, with layer-skipping support) → <strong>Normalization Unit</strong>.</li>
+      </ul>
+      <p style="font-size:13px;color:var(--muted)">Peng et al., "HAAN: A Holistic Approach for Accelerating Normalization Operations in LLMs," 2025.</p>
+
+      <h3>PICACHU: a reconfigurable nonlinear engine <span class="tag">CGRA</span></h3>
+      <p>PICACHU is a <strong>plug-in coarse-grained reconfigurable array (CGRA)</strong> tailored to nonlinear ops, using custom algorithms plus a dedicated compiler toolchain.</p>
+      <ul class="clean">
+        <li><strong>Decompose</strong>: every LLM nonlinearity breaks into a few math operators — Softmax/GeLU/SwiGLU need <strong>division + exponential</strong>, LayerNorm/RMSNorm need <strong>inverse √</strong>, RoPE needs <strong>sine/cosine</strong>.</li>
+        <li><strong>Heterogeneous tiles</strong>: Branch-optimized (BrT), Basic (BaT), and Compute (CoT) tiles, each with distinct functional units, plus <strong>Precision-Aware FUs</strong> (vector adders/multipliers reconfigurable across bit-widths).</li>
+        <li><strong>Compiler</strong> does pattern matching &amp; offloading (e.g. <span class="mono">fmul…fadd ⇒ GeLU</span>), emitting <span class="mono">@cgra_SOFTMAX</span>, <span class="mono">@cgra_LAYERNORM</span> calls.</li>
+      </ul>
+      <p style="font-size:13px;color:var(--muted)">Qin et al., "PICACHU: Plug-In CGRA Handling Upcoming Nonlinear Operations in LLMs," ASPLOS 2025.</p>
+    </section>
+
+    <hr class="rule">
+
+    <section id="backprop">
+      <div class="sec-head"><span class="num">03</span><h2>Hardware for the backward pass</h2></div>
+      <p class="lede">The backward pass is the same matmul engine run with <strong>transposed operands</strong>. The key hardware insight: you never build a separate transpose unit — you feed the <em>same</em> systolic array from a different edge.</p>
+
+      <h3>Backprop is two transposed matmuls</h3>
+      <p>For a linear layer <span class="mono">Y = X·W</span> (with <var>X</var>: <var>L</var>×<var>E</var>, <var>W</var>: <var>E</var>×<var>E</var>), the backward pass computes an <strong>input/activation gradient</strong> and a <strong>weight gradient</strong>:</p>
+      <div class="formula"><span class="eq">∇<var>X</var> = ∇<var>Y</var> · <var>Wᵀ</var></span><span class="lbl">activation gradient (flows to prev layer)</span></div>
+      <div class="formula"><span class="eq">∇<var>W</var> = <var>Xᵀ</var> · ∇<var>Y</var></span><span class="lbl">weight gradient (used by optimizer)</span></div>
+      <p>The same structure holds for a <strong>1×1 convolution</strong> viewed as a matmul with <var>X</var>: <var>BHW</var>×<var>C</var>, <var>W</var>: <var>C</var>×<var>N</var>:</p>
+      <div class="tbl-scroll"><table>
+        <thead><tr><th>Pass</th><th>Operation</th><th>Shapes</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Forward</strong></td><td><span class="mono">Y = X·W</span></td><td>(<var>BHW</var>×<var>C</var>)·(<var>C</var>×<var>N</var>) = (<var>BHW</var>×<var>N</var>)</td></tr>
+          <tr><td><strong>Activation grad</strong></td><td><span class="mono">∇X = ∇Y·Wᵀ</span></td><td>(<var>BHW</var>×<var>N</var>)·(<var>N</var>×<var>C</var>) = (<var>BHW</var>×<var>C</var>)</td></tr>
+          <tr><td><strong>Weight grad</strong></td><td><span class="mono">∇W = Xᵀ·∇Y</span></td><td>(<var>C</var>×<var>BHW</var>)·(<var>BHW</var>×<var>N</var>) = (<var>C</var>×<var>N</var>)</td></tr>
+        </tbody>
+      </table></div>
+      <div class="call key"><span class="k">In-place transposed matmul</span><p>Training needs transposed matmuls, but building dedicated transpose hardware is wasteful. Instead, <strong>transposition is absorbed into the systolic array's dataflow</strong> — the transpose is realized by <em>which edge you inject operands and which edge you read results from</em>. One array, three dataflows.</p></div>
+
+      <h3>Three dataflows on one systolic array</h3>
+      <p>Reusing the same weight-stationary array, only the injection/read directions change:</p>
+      <div class="tbl-scroll"><table>
+        <thead><tr><th>Computation</th><th>Stationary</th><th>Input feeds from</th><th>Output read at</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Forward</strong> <span class="mono">X·W</span></td><td>Weights preloaded</td><td>Bottom (streams up)</td><td>Right</td></tr>
+          <tr><td><strong>Activation grad</strong> <span class="mono">∇Y·Wᵀ</span></td><td>Weights preloaded</td><td>Left (data gradient)</td><td>Top (accumulate upward)</td></tr>
+          <tr><td><strong>Weight grad</strong> <span class="mono">Xᵀ·∇Y</span></td><td>Accumulation-stationary</td><td>∇Y from left, X from bottom</td><td>Stored in cells</td></tr>
+        </tbody>
+      </table></div>
+      <p>For the weight gradient the products <strong>accumulate and stay inside the systolic cells</strong> — exactly the accumulation-stationary mode below.</p>
+
+      <h3>Two flavors of systolic cell</h3>
+      <p>A systolic cell is a MAC that passes data to its neighbors. Which value it "keeps" defines the dataflow:</p>
+      <div class="cards">
+        <div class="card"><p class="q">Weight-stationary</p><p><span class="mono">z = w·x + y ; v = x</span>. The weight <var>w</var> stays in the cell; data <var>x</var>,<var>y</var> flow through. Used for forward and activation-gradient passes.</p></div>
+        <div class="card"><p class="q">Accumulation-stationary</p><p><span class="mono">z = y ; v = x ; q = x·y + q</span>. The running sum <var>q</var> stays in the cell (stored in the MAC). Used for the weight-gradient pass.</p></div>
+      </div>
+      <p>Worked accumulation-stationary example: with <span class="mono">y=2, x=4</span>, the cell passes <span class="mono">z=2</span> (old <var>y</var>) and <span class="mono">v=4</span> (old <var>x</var>) to neighbors while updating <span class="mono">q = 4·2 + 0 = 8</span> locally — the partial sum never leaves the cell until the tile finishes.</p>
+    </section>
+
+    <hr class="rule">
+
+    <section id="precision">
+      <div class="sec-head"><span class="num">04</span><h2>Reduced-precision training: BFP &amp; FAST</h2></div>
+      <p class="lede">Training in FP32 is expensive. The trick is <strong>block floating point (BFP)</strong> plus a schedule that starts <strong>low-precision and grows precise</strong> — fast first, accurate second.</p>
+
+      <h3>Block floating point <span class="tag">dot product</span></h3>
+      <p>In BFP, a <em>group</em> of values shares one exponent; only the mantissas differ. A dot product multiplies the shared exponents once and sums the mantissa products:</p>
+      <div class="formula"><span class="eq">(2² · [+14,+2]) · (2⁴ · [+4,−9]) = 2⁶ · (14·4 + 2·(−9)) = 2⁶ · [+38]</span><span class="lbl">exponent add + mantissa MACs</span></div>
+      <div class="call good"><span class="k">Why BFP beats plain FP</span><p>Ordinary FP does an <strong>exponent addition and mantissa alignment for every element</strong>. BFP does them <strong>only once per group</strong> — the per-element work is just integer mantissa multiplies. Cheaper hardware, most of the dynamic range preserved.</p></div>
+
+      <h3>FAST: Fast First, Accurate Second Training</h3>
+      <p>Two observations from prior work motivate a precision schedule:</p>
+      <ul class="clean">
+        <li>Adding <strong>zero-mean Gaussian noise to the weight gradient ∇W</strong> reduces overfitting and improves convergence.</li>
+        <li><strong>Decreasing the noise variance over iterations</strong> beats a fixed noise level throughout training.</li>
+        <li>Hypothesis: the same effect can be had by <strong>adjusting the BFP precision</strong> of weights, activations, and gradients from <strong>low to high</strong> over training — low precision <em>is</em> the noise.</li>
+      </ul>
+      <p>FAST progressively raises BFP precision along <strong>two axes</strong> — training iteration and layer depth:</p>
+      <div class="tbl-scroll"><table>
+        <thead><tr><th>Scheme</th><th>Early / shallow</th><th>Late / deep</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Temporal</strong> High-to-Low</td><td>FP32 for weights/acts/grads (first part)</td><td>Lower-precision BFP (second part)</td></tr>
+          <tr><td><strong>Layerwise</strong> High-to-Low</td><td>FP32 for the first ~10 layers</td><td>Lower-precision BFP for later layers</td></tr>
+        </tbody>
+      </table></div>
+      <div class="call key"><span class="k">FAST = progressive precision</span><p>Move in the <em>opposite</em> direction of the naive scheme: start <strong>low</strong> precision (cheap, noisy, fast) and increase mantissa bit-width across both <strong>layer depth</strong> and <strong>iterations</strong>. On ResNet-18/ImageNet the per-layer (W,A,G) precision visibly climbs from (2,2,2) early to (4,4,4) late.</p></div>
+
+      <h3>FAST system design</h3>
+      <ul class="clean">
+        <li><strong>Systolic array of fMACs</strong> — FAST multiply-accumulate units that operate on <strong>chunks of BFP mantissas (e.g. 2-bit chunks)</strong>, so mantissa width is variable in 2-bit increments.</li>
+        <li><strong>BFP converters</strong>, an accumulator + systolic-array input generator, and a memory subsystem with separate <strong>Weight / Data / Gradient SRAMs</strong>.</li>
+      </ul>
+      <h3>Evaluation — Time-to-Accuracy</h3>
+      <p>Using <strong>Time-to-Accuracy (TTA)</strong> to hit 68% on ResNet-18/ImageNet, FAST reaches the target fastest across all numeric formats (normalized training time, lower is better):</p>
+      <div class="tbl-scroll"><table>
+        <thead><tr><th>Format</th><th>FAST-Adaptive</th><th>MidBFP</th><th>MSFP-12</th><th>INT-12</th><th>bfloat16</th><th>Nvidia MP</th><th>FP32</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Normalized TTA</strong></td><td>1.00</td><td>1.86</td><td>2.27</td><td>2.92</td><td>3.85</td><td>5.69</td><td>8.51</td></tr>
+        </tbody>
+      </table></div>
+      <p style="font-size:13px;color:var(--muted)">Zhang, McDanel &amp; Kung, "FAST: DNN Training under Variable Precision Block Floating Point with Stochastic Rounding," HPCA 2022.</p>
+    </section>
+
+    <hr class="rule">
+
+    <section id="memory">
+      <div class="sec-head"><span class="num">05</span><h2>Memory-efficient training</h2></div>
+      <p class="lede">Backprop must keep every layer's <strong>input activations</strong> alive until its gradient arrives — so <strong>activation memory, not weights, dominates</strong> training storage. Two ideas fight this: don't store activations (reversible nets) and don't train everything (Duplex).</p>
+
+      <h3>Activations dominate the footprint</h3>
+      <ul class="clean">
+        <li>In the forward pass each layer's output must be <strong>retained</strong>; in the backward pass those stored activations are consumed to form gradients — so <strong>memory grows proportional to depth</strong>.</li>
+        <li>Normalized training-storage (weights + activations) is overwhelmingly <strong>activation</strong>: ResNet-18 <span class="mono">1×</span> → ResNet-34 <span class="mono">1.67×</span> → ResNet-50 <span class="mono">6.6×</span> → VGG-16 <span class="mono">13.4×</span>.</li>
+        <li>Edge devices have small on-chip storage → frequent, costly <strong>off-chip memory access</strong>.</li>
+      </ul>
+
+      <h3>Reversible networks <span class="tag">RevNet</span></h3>
+      <p>A <em class="term">reversible residual network</em> splits the input into <span class="mono">(x₁, x₂)</span> so that the inputs can be <strong>reconstructed from the outputs</strong> — no need to store activations:</p>
+      <div class="formula"><span class="eq">Forward:  <var>y₂</var> = F₁(<var>x₁</var>) + <var>x₂</var> ,   <var>y₁</var> = F₂(<var>y₂</var>) + <var>x₁</var></span><span class="lbl">two coupled residual blocks</span></div>
+      <div class="formula"><span class="eq">Backward:  <var>x₁</var> = <var>y₁</var> − F₂(<var>y₂</var>) ,   <var>x₂</var> = <var>y₂</var> − F₁(<var>x₁</var>)</span><span class="lbl">recompute inputs from outputs</span></div>
+      <div class="call good"><span class="k">The memory win</span><p>Because inputs are recoverable, the backward pass runs in <strong>three steps — recompute the input, compute the input gradient, then compute &amp; apply the weight gradient</strong> — <em>without ever storing the input activations</em>. Memory is traded for a bit of recomputation.</p></div>
+
+      <h3>Duplex DNN <span class="tag">train a subset</span></h3>
+      <p>Reversibility raises <strong>compute</strong> demand. Duplex answers with a <strong>frozen backbone + trainable branch</strong>:</p>
+      <ul class="clean">
+        <li>A pretrained <strong>backbone DNN is frozen</strong> during the backward pass — only a small reversible <strong>branch DNN</strong> is trained, minimizing training cost.</li>
+        <li><strong>Normalization layers are removed</strong> from the branch DNN to facilitate (and simplify) training.</li>
+      </ul>
+      <p style="font-size:13px;color:var(--muted)">Zhang et al., "CAMEL: Co-Designing AI Models and eDRAMs for Efficient On-Device Learning," HPCA 2024.</p>
+    </section>
+
+    <hr class="rule">
+
+    <section id="recap">
+      <div class="sec-head"><span class="num">★</span><h2>Exam recap</h2></div>
+      <div class="cards">
+        <div class="card"><p class="q">Training ≠ inference</p><p>Adds backward pass, transposed matmuls, and long-lived activations. Matmul is ~52–57% of latency; nonlinear ops are the rest.</p></div>
+        <div class="card"><p class="q">Non-matmul tricks</p><p>exp, ÷, 1/√ all become shift-and-add in the log domain via <span class="mono">2ᵛ ≈ 1+v/2</span> and <span class="mono">log₂(1+m) ≈ m</span>. Else: table lookup.</p></div>
+        <div class="card"><p class="q">HAAN / PICACHU</p><p>HAAN predicts LayerNorm stats across layers to skip work. PICACHU is a CGRA that decomposes nonlinearities into math operators.</p></div>
+        <div class="card"><p class="q">Backprop math</p><p>∇X = ∇Y·Wᵀ (activation grad), ∇W = Xᵀ·∇Y (weight grad). Two transposed matmuls.</p></div>
+        <div class="card"><p class="q">One array, 3 dataflows</p><p>Transpose is free — feed the systolic array from a different edge. Weight-stationary vs accumulation-stationary cells.</p></div>
+        <div class="card"><p class="q">BFP</p><p>Shared exponent per group → exponent add once, not per element. Cheaper than FP with similar range.</p></div>
+        <div class="card"><p class="q">FAST</p><p>Progressively raise BFP precision over depth + iterations. Low precision = gradient noise. Lowest TTA (1.00 vs FP32's 8.51).</p></div>
+        <div class="card"><p class="q">Memory-efficient</p><p>Activations dominate (VGG-16: 13.4×). RevNet recomputes inputs; Duplex freezes the backbone, trains a branch.</p></div>
+      </div>
+    </section>
+
+    <footer>
+      Study note compiled from <em>Lecture 12 — Transformer and DNN Training Accelerators</em>, NYU SAI Lab, Spring 2026. Key references: Brenner, Algorithm 467 (ACM TOMS, 1973) · Xia &amp; Zhang, "Softmax Acceleration" (arXiv:2311.13290, 2023) · Peng et al., HAAN (arXiv:2502.11832, 2025) · Qin et al., PICACHU (ASPLOS 2025) · Zhang, McDanel &amp; Kung, FAST (HPCA 2022) · Zhang et al., CAMEL (HPCA 2024).
+    </footer>
+  </main>
+</div>
+<script src="theme.js"></script>
+</body>
+</html>

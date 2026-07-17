@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lecture 11: Transformer &amp; LLM Accelerators — Study Note</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+  <nav class="toc">
+    <a class="home" href="index.html">← All lectures</a>
+    <div class="brand">11 · CNN &amp; Transformer Accelerators</div>
+    <a href="#template"><span class="n">01</span>The accelerator template</a>
+    <a class="sub" href="#template">Compute core &amp; memory</a>
+    <a class="sub" href="#template">Reuse &amp; double buffering</a>
+    <a href="#systolic"><span class="n">02</span>Systolic arrays</a>
+    <a class="sub" href="#systolic">The systolic cell</a>
+    <a class="sub" href="#systolic">Skewed dataflow</a>
+    <a href="#column"><span class="n">03</span>Column combining</a>
+    <a href="#term"><span class="n">04</span>Term quantization</a>
+    <a class="sub" href="#term">HESE · tMAC</a>
+    <a class="sub" href="#term">Multi-resolution</a>
+    <a href="#cnn"><span class="n">05</span>Classic CNN accelerators</a>
+    <a href="#transformer"><span class="n">06</span>Transformer accelerators</a>
+    <a class="sub" href="#transformer">Non-matmul ops</a>
+    <a class="sub" href="#transformer">Tiling &amp; transposition</a>
+    <a href="#recap"><span class="n">★</span>Exam recap</a>
+  </nav>
+
+  <main>
+    <header class="mast">
+      <p class="eyebrow">Lecture 11 · Study Note</p>
+      <h1>CNN &amp; Transformer Accelerators</h1>
+      <p class="sub">How specialized hardware runs deep networks fast and cheap — the accelerator template, systolic arrays for matmul, packing sparsity and terms into the array, the classic CNN chips, and what changes when the workload becomes a transformer.</p>
+      <div class="meta-row">
+        <span class="chip">NYU SAI Lab</span>
+        <span class="chip">Spring 2026</span>
+        <span class="chip">Systolic arrays · TPU</span>
+        <span class="chip">Column combining · Term quant.</span>
+        <span class="chip">Diannao · Eyeriss · Cnvlutin</span>
+      </div>
+    </header>
+
+    <section id="template">
+      <div class="sec-head"><span class="num">01</span><h2>The AI-accelerator template</h2></div>
+      <p class="lede">An <em class="term">AI accelerator</em> is a co-processor that executes the part of the machine code tied to the AI workload — mostly big matrix multiplies. It sits beside the CPU and GPU on a <span class="mono">NoC</span>, sharing DRAM.</p>
+
+      <h3>Anatomy of the chip</h3>
+      <p>Every design in this lecture is a variation on the same block diagram: a small on-chip memory hierarchy feeding a dense arithmetic core.</p>
+      <ul class="clean">
+        <li><strong>Compute core</strong> — a <strong>Matrix MAC</strong> (2-D grid of multiply-accumulators) for matrix multiplication, plus a <strong>Vector MAC</strong> and a <strong>Special Function Unit</strong> for the non-matmul operations (activations, normalization).</li>
+        <li><strong>Weight SRAM</strong> — holds the persistent weights streamed in from DRAM.</li>
+        <li><strong>Activation / Data SRAM</strong> — holds transient input and output feature maps.</li>
+        <li><strong>Register file + accumulator</strong> — staging and partial-sum accumulation, steered by <em class="term">control bits</em> through a memory controller.</li>
+      </ul>
+      <div class="call key"><span class="k">Why a separate accelerator at all</span><p>General cores waste energy on instruction fetch, control, and cache coherence. An accelerator spends its area on <strong>arithmetic and local SRAM</strong>, so the same silicon does far more MACs per joule — the entire field is about keeping that MAC array fed without paying DRAM energy on every operand.</p></div>
+
+      <h3>Memory access reduction <span class="tag">the central idea</span></h3>
+      <p>Consider a 2×2 matmul <span class="mono">W·X = Y</span>. A weight such as <span class="mono">W₀₀</span> is loaded once from Weight SRAM and <strong>held in the compute core</strong>; inputs stream past it from Activation SRAM and each product accumulates into the running <span class="mono">Y</span>.</p>
+      <div class="formula"><span class="eq">Y₀₀ = W₀₀X₀₀ + W₀₁X₁₀ ,   Y₀₁ = W₀₀X₀₁ + W₀₁X₁₁</span><span class="lbl">2×2 product</span></div>
+      <div class="call good"><span class="k">The lever</span><p>The computation order and memory-access pattern can be <strong>rescheduled to minimize cost without changing the result</strong>. Reusing an operand already on-chip — instead of re-fetching it from DRAM — is the single biggest energy win, because a DRAM access can cost <em>hundreds of times</em> more energy than a MAC.</p></div>
+
+      <h3>Spatial reuse &amp; double buffering</h3>
+      <p>A <em class="term">spatial architecture</em> lays many processing elements (PEs) in a grid so an operand fetched once from memory can be reused across the whole row or column of PEs — great reuse, reduced memory-access cost.</p>
+      <div class="call key"><span class="k">Double buffering (ping-pong)</span><p>Split the input buffer into <span class="mono">Mem₁</span> and <span class="mono">Mem₂</span>. While the systolic array <em>consumes</em> one buffer, DRAM <em>fills</em> the other; then they swap. This <strong>overlaps data production and consumption</strong>, hiding DRAM latency so the array never stalls waiting for operands.</p></div>
+    </section>
+
+    <hr class="rule">
+
+    <section id="systolic">
+      <div class="sec-head"><span class="num">02</span><h2>Systolic arrays</h2></div>
+      <p class="lede">The workhorse matmul engine. Coined by <strong>Kung &amp; Leiserson (1978)</strong> and Kung (1982), it is a 2-D grid of MACs through which data flows rhythmically — "systolic," like a heartbeat. Google's <strong>TPU (2017)</strong> is a systolic array.</p>
+
+      <h3>The systolic cell <span class="tag">weight-stationary</span></h3>
+      <p>Each cell holds one weight <var>w</var> and does two things per beat: a multiply-accumulate, and a pass-through of its input to the neighbor above.</p>
+      <div class="formula"><span class="eq">z = <var>w</var>·<var>x</var> + <var>y</var> ,   <var>v</var> = <var>x</var></span><span class="lbl">MAC + forward</span></div>
+      <ul class="clean">
+        <li><strong>Inputs:</strong> data <var>x</var> enters from below, partial sum <var>y</var> enters from the left.</li>
+        <li><strong>Weight <var>w</var> stays</strong> resident in the cell's MAC — hence <em class="term">weight-stationary</em>.</li>
+        <li><strong>Outputs:</strong> the updated partial sum <var>z</var> exits right; the data <var>v</var> = <var>x</var> exits up to the next row.</li>
+      </ul>
+      <p>Worked cell: with <span class="mono">w = 6</span>, <span class="mono">x = 4</span>, <span class="mono">y = 2</span> → <span class="mono">z = 6·4 + 2 = 26</span> flows right, <span class="mono">v = 4</span> flows up.</p>
+      <div class="call key"><span class="k">Why weight-stationary wins</span><p>Weights are loaded <strong>once</strong> and reused for every input in the batch. Only activations and partial sums move — the highest-volume operand (weights) pays zero repeated fetch cost. This is the reuse principle of §1 made physical.</p></div>
+
+      <h3>Inside the cell: the bit-serial MAC</h3>
+      <p>The MAC can be built <strong>bit-serially</strong>: a <em class="term">bit-serial multiplier-accumulator</em> feeds each weight bit <span class="mono">W₇…W₀</span> through an AND gate against the streamed input <span class="mono">Xᵢ</span>, summing partial products through a chain of full adders with enable/reset control. Small area, one bit per cycle — a natural fit for the term-level tricks in §4.</p>
+
+      <h3>Skewed dataflow: a worked matmul</h3>
+      <p>Compute <span class="mono">W · X</span> with</p>
+      <div class="formula"><span class="eq">W = [[2,−1,1],[−2,3,−4]] ,  X = [[1,0],[0,3],[−2,2]] ,  Y = [[0,−1],[6,1]]</span><span class="lbl">2×3 · 3×2</span></div>
+      <ul class="clean">
+        <li><strong>Weights preloaded</strong> (shown in red) into the array, one per cell.</li>
+        <li>Data enters from the bottom in a <strong>skewed (staggered) schedule</strong> — each column is delayed one beat relative to its neighbor so operands meet their partial sums at the right time.</li>
+        <li>Partial sums march left-to-right; as each column's inputs sweep through, a completed output element falls out of the right edge.</li>
+      </ul>
+      <div class="call warn"><span class="k">Why the input is skewed</span><p>All cells fire on the same clock, but the data destined for cell (i, j) must arrive exactly when the partial sum from (i, j−1) does. Staggering the inputs by one cycle per column aligns every operand with its accumulator — no explicit scheduling logic needed, the geometry does it.</p></div>
+    </section>
+
+    <hr class="rule">
+
+    <section id="column">
+      <div class="sec-head"><span class="num">03</span><h2>Packing sparsity: column combining</h2></div>
+      <p class="lede">Pruning zeros out small weights — but a systolic array is a <strong>dense</strong> grid, so a zeroed cell still occupies silicon and a clock cycle. <em class="term">Column combining</em> (Kung, McDanel &amp; Zhang, ASPLOS 2019) makes that sparsity pay off.</p>
+
+      <div class="call bad"><span class="k">The problem</span><p>After pruning, the weight matrix is sparse and irregular. It is <strong>hard to leverage those zero weights to reduce hardware cost</strong> — a naive systolic array runs the zeros anyway, wasting most of the array.</p></div>
+
+      <h3>The idea</h3>
+      <p>Overlay several <strong>sparse columns</strong> of the weight matrix into a single <strong>packed column</strong> of the systolic array. Because each original column is mostly zero, their non-zeros rarely collide — so one physical column can carry the work of many logical ones.</p>
+      <ul class="clean">
+        <li>When two candidate weights <em>do</em> land in the same packed position, keep the one with <strong>larger magnitude</strong> (e.g. <span class="mono">−6</span> kept over a smaller rival) and prune the other.</li>
+        <li>The packed cell's MAC <strong>multiplexes</strong> the correct input (say <span class="mono">x₃</span> vs <span class="mono">x₄</span>) for the surviving weight.</li>
+        <li>Reported result: an <strong>8× reduction</strong> in packed systolic-array size.</li>
+      </ul>
+      <div class="call good"><span class="k">Vs. filterwise pruning</span><p>Compared with column-wise (filterwise) structured pruning, column combining allows a <strong>much more flexible pruning pattern</strong> — it keeps individual important weights that structured pruning would be forced to drop, then packs them densely. It can also be applied to each layer's <em>input</em> channels.</p></div>
+
+      <h3>The training loop &amp; row permutation</h3>
+      <ul class="clean">
+        <li><strong>Column-combining pruning</strong> iterates: <em>prune round i → combine → fine-tune → prune round i+1</em>, jointly optimizing accuracy and packability.</li>
+        <li><strong>Row permutation</strong> resolves collisions: reorder input rows so that large weights spread across packed columns. Two hardware realizations — <strong>Muxed</strong> (multiplexer selects the input) and <strong>Twisted</strong> (physically re-routed wiring).</li>
+      </ul>
+
+      <h3>Hardware &amp; results</h3>
+      <div class="tbl-scroll"><table>
+        <thead><tr><th>Implementation detail</th><th>Value</th></tr></thead>
+        <tbody>
+          <tr><td>FPGA board</td><td>Xilinx VC707 Evaluation Board</td></tr>
+          <tr><td>Lookup tables / flip-flops</td><td><span class="mono">303,600 LUT · 607,200 FF</span></td></tr>
+          <tr><td>BRAM</td><td><span class="mono">1030 blocks, 36 Kb each</span></td></tr>
+          <tr><td>Systolic array size</td><td><span class="mono">128 × 64</span> · &gt;15K lines of Verilog</td></tr>
+        </tbody>
+      </table></div>
+      <div class="tbl-scroll"><table>
+        <thead><tr><th>VGG-19 on ImageNet (87.5% sparsity)</th><th>Accuracy</th></tr></thead>
+        <tbody>
+          <tr><td>Original DNN</td><td>72.08%</td></tr>
+          <tr><td>Structured filterwise pruning</td><td>69.0%</td></tr>
+          <tr><td><strong>Column combining</strong></td><td><strong>71.81%</strong></td></tr>
+        </tbody>
+      </table></div>
+      <p style="font-size:13px;color:var(--muted)">Column combining recovers almost all the accuracy lost by structured pruning while staying hardware-friendly. ResNet-20/CIFAR-10 tuned with <span class="mono">α=8, β=20, γ=0.5</span>.</p>
+    </section>
+
+    <hr class="rule">
+
+    <section id="term">
+      <div class="sec-head"><span class="num">04</span><h2>Term quantization</h2></div>
+      <p class="lede">Quantization shrinks models but low precision hurts. <em class="term">Term quantization</em> (Kung, McDanel &amp; Zhang, SC20) instead budgets the number of <strong>power-of-two terms</strong> — a finer knob than bit-width.</p>
+
+      <h3>Why uniform low-precision fails</h3>
+      <p>Take weights <span class="mono">W = {1, 12, 5, 137}</span> in 8-bit. Dropping to 4-bit simply <strong>truncates the low bits</strong>, giving <span class="mono">{0, 0, 0, 128}</span> — three of four weights vanish.</p>
+      <div class="call bad"><span class="k">Root cause</span><p>Uniform quantization spends bits uniformly, but <strong>both weights and activations are highly biased</strong> in value — most are small, a few are large. Uniform low precision therefore incurs large quantization error exactly where the values live.</p></div>
+
+      <h3>Values as sums of power-of-two terms</h3>
+      <p>Any integer is a sum of power-of-two terms, and a product of two values is a sum of <strong>term-pair</strong> products:</p>
+      <div class="formula"><span class="eq">12 = 2³ + 2² ,   137 = 2⁷ + 2³ + 2⁰</span><span class="lbl">term decomposition</span></div>
+      <div class="formula"><span class="eq">W₂X₂ = 12·2 = (2³+2²)·2¹ = 2³·2¹ + 2²·2¹</span><span class="lbl">term-pair products</span></div>
+      <p>Empirically, <strong>most quantized weight and data values need only 2–3 terms</strong> — so a "term budget" throws away far less signal than truncating bits.</p>
+
+      <h3>The term budget</h3>
+      <p>Set a <strong>group term budget</strong>: for a group of values, rank all terms by magnitude and keep only the largest few, dropping the small ones. This controls term-level computation directly.</p>
+      <div class="tbl-scroll"><table>
+        <thead><tr><th>W = {1, 12, 5, 137}</th><th>W′ result</th></tr></thead>
+        <tbody>
+          <tr><td>4-bit uniform quantization</td><td><span class="mono">{0, 0, 0, 128}</span></td></tr>
+          <tr><td><strong>TQ, budget = 4</strong></td><td><span class="mono">{0, 12, 0, 136}</span></td></tr>
+        </tbody>
+      </table></div>
+      <p>At the same nominal cost, TQ keeps the <strong>12</strong> and reconstructs <strong>137</strong> far more faithfully (136 vs 128), because it spends its budget on the terms that actually carry magnitude.</p>
+
+      <h3>HESE: fewer terms via signed powers <span class="tag">Hybrid Encoding</span></h3>
+      <p>To minimize the term count in the binary input, <em class="term">Hybrid Encoding for Shortened Expressions (HESE)</em> allows <strong>signed</strong> power-of-two terms (a term may be subtracted). This yields a minimum-length expression and far fewer term-pair multiplications.</p>
+      <div class="tbl-scroll"><table>
+        <thead><tr><th>Value</th><th>Binary expression</th><th>HESE (signed)</th></tr></thead>
+        <tbody>
+          <tr><td><strong>31</strong></td><td><span class="mono">2⁴+2³+2²+2¹+2⁰</span> — 5 terms</td><td><span class="mono">2⁵−2⁰</span> — <strong>2 terms</strong></td></tr>
+          <tr><td><strong>27</strong></td><td><span class="mono">2⁴+2³+2¹+2⁰</span> — 4 terms</td><td><span class="mono">2⁵−2²−2⁰</span> — <strong>3 terms</strong></td></tr>
+        </tbody>
+      </table></div>
+
+      <h3>The tMAC: hardware for term-pairs</h3>
+      <p>The <em class="term">term MAC (tMAC)</em> implements TQ efficiently: it processes all term-pair multiplications across a group of weight and data values. Each term is just its <strong>exponent (2–3 bits)</strong>, so a multiplication of two terms becomes an <strong>exponent addition</strong>, and accumulation reduces to <strong>half adders</strong>. tMACs tile into a systolic array fed by weight/data exponent queues, a weight index queue, and a term accumulator.</p>
+      <div class="call key"><span class="k">Error analysis</span><p>On ResNet-18, a group of 8 weights encoded with 14 terms = only <strong>1.75 terms per weight</strong> on average. TQ adds a small error over 8-bit uniform, but achieves <strong>much lower error than 6-/7-bit uniform</strong> — 1.75 terms/value matches the quantization error of <strong>5-bit uniform</strong> at a fraction of the compute.</p></div>
+
+      <h3>Multi-resolution inference <span class="tag">Zhang et al., ASPLOS 2021</span></h3>
+      <p>Because the term budget is a dial, one model can run at <strong>different "resolutions."</strong> On a full battery use budget 60 (higher accuracy); on a low battery drop to budget 16 — trading hardware cost for accuracy along a smooth curve.</p>
+      <ul class="clean">
+        <li>Train a <strong>meta multi-resolution model</strong> whose sub-models correspond to different term budgets (e.g. 2, 4, …, 10) — the terms are <strong>reusable</strong>, so a low-budget model is a prefix of a high-budget one.</li>
+        <li>Training uses <strong>knowledge distillation</strong>: each iteration jointly trains two sub-models, a <em>teacher</em> and a <em>student</em>, with loss <span class="mono">L = L_T + L_S</span> — cheaper than training all sub-models together.</li>
+        <li>Energy scales with the weight/data term budgets (<span class="mono">α</span> processed in <span class="mono">γ</span> cycles).</li>
+      </ul>
+      <div class="call good"><span class="k">Result</span><p>Multi-resolution DNN incurs only <strong>0.4%–3.8% degradation</strong> vs. the FP baseline (70.2%), while <strong>energy efficiency grows 3.25× on average</strong> as the term budget falls from 60 to 16.</p></div>
+    </section>
+
+    <hr class="rule">
+
+    <section id="cnn">
+      <div class="sec-head"><span class="num">05</span><h2>Classic CNN accelerators</h2></div>
+      <p class="lede">The canonical designs every accelerator paper cites. Each attacks the same enemy — data movement — from a different angle: dataflow, reconfiguration, or skipping zeros.</p>
+
+      <h3>Diannao <span class="tag">Chen et al., 2014</span></h3>
+      <p>The <strong>first popular end-to-end DNN (CNN) accelerator.</strong> Synthesized at 65nm with Synopsys tools, hitting <strong>482 GOP/s</strong>. Its Neural Functional Unit (<span class="mono">NFU</span>) is a three-stage pipeline:</p>
+      <ul class="clean">
+        <li><strong>NFU-1:</strong> multiplier units.</li>
+        <li><strong>NFU-2:</strong> an adder tree that reduces the products.</li>
+        <li><strong>NFU-3:</strong> the nonlinear unit (activation).</li>
+      </ul>
+      <p>Input/output buffers <span class="mono">NBin / NBout</span> and synapse buffer <span class="mono">SB</span> stage operands, fed by DMA under a control processor.</p>
+
+      <h3>Eyeriss <span class="tag">row-stationary</span></h3>
+      <p>Eyeriss optimizes the <strong>energy of the whole system</strong> — accelerator chip <em>and</em> off-chip DRAM — across varied CNN shapes by <strong>reconfiguring the architecture</strong>. Core: a spatial array of <strong>168 PEs</strong> in a <strong>12 × 14</strong> rectangle, a <strong>108-kB global buffer (GLB)</strong>, an RLC CODEC, and a ReLU module.</p>
+      <div class="call key"><span class="k">Data reuse in a PE set</span><p>Row-stationary dataflow reuses three ways at once: <strong>filter rows</strong> stream horizontally across PEs, <strong>ifmap rows</strong> stream diagonally, and <strong>partial sums</strong> accumulate vertically. Reuse and accumulation <em>inside</em> the PE set cut accesses to the GLB and DRAM — where the energy actually goes.</p></div>
+
+      <h3>Run-length encoding (RLC)</h3>
+      <p>Eyeriss compresses input activations with <em class="term">RLC</em>, exploiting the ~50% zeros ReLU produces. A stream like <span class="mono">0,0,12,0,0,0,0,53,0,0,22</span> is stored as (Run, Level) pairs in a 64-bit word:</p>
+      <div class="formula"><span class="eq">[Run 5b | Level 16b] × 3 + [Term 1b]  →  (2,12)(4,53)(2,22)</span><span class="lbl">RLC word</span></div>
+
+      <h3>Cnvlutin <span class="tag">Albericio et al., 2016</span></h3>
+      <p>A <strong>value-based</strong> accelerator: since a large fraction of CNN MACs are <strong>intrinsically ineffectual</strong> (one operand is zero), Cnvlutin skips them entirely. It encodes non-zero activations as a value list plus an <strong>offset</strong> list — <span class="mono">[1,0,3] → values [1,3], offsets [0,2]</span> — and indexes the matching weights, improving performance and energy <strong>with no accuracy loss</strong>.</p>
+    </section>
+
+    <hr class="rule">
+
+    <section id="transformer">
+      <div class="sec-head"><span class="num">06</span><h2>Transformer accelerators</h2></div>
+      <p class="lede">A transformer is still mostly matmul, so the systolic array carries over — but attention adds <strong>transposition, softmax, and layernorm</strong>, and these non-matmul operations are no longer negligible.</p>
+
+      <h3>The self-attention dataflow</h3>
+      <p>With batch <var>B</var>, sequence length <var>L</var>, embedding <var>E</var>, the block is a fixed sequence of shaped matmuls around a softmax:</p>
+      <ul class="clean">
+        <li><strong>LayerNorm</strong> the input <var>X</var>, then project to Q, K, V: <span class="mono">(B,L,E)·(E,E) → (B,L,E)</span> for each.</li>
+        <li><strong>Scores:</strong> <span class="mono">QKᵀ → (B,L,E)·(B,E,L) → (B,L,L)</span> — the <var>L²</var> term.</li>
+        <li><strong>Scale + Softmax:</strong> <span class="mono">softmax(QKᵀ) → (B,L,L)</span>.</li>
+        <li><strong>Context:</strong> <span class="mono">softmax(QKᵀ)·V → (B,L,L)·(B,L,E) → (B,L,E)</span>.</li>
+        <li><strong>Output projection</strong> (linear), then a residual add with the block input.</li>
+      </ul>
+
+      <h3>Operations other than multiplications</h3>
+      <p>Beyond matmul, the accelerator must handle:</p>
+      <ul class="clean">
+        <li><strong>Transposition</strong> — needed to form <span class="mono">Kᵀ</span> and to re-lay-out tiles.</li>
+        <li><strong>Nonlinear ops</strong> — <em class="term">Softmax</em>, <em class="term">LayerNorm</em>, and <em class="term">GeLU</em>, all routed to the Special Function Unit.</li>
+      </ul>
+      <div class="tbl-scroll"><table>
+        <thead><tr><th>Latency breakdown</th><th>Matmul</th><th>Normalization</th><th>Softmax</th><th>Others</th></tr></thead>
+        <tbody>
+          <tr><td><strong>GPT-2</strong></td><td>52.2%</td><td>16.1%</td><td>13.9%</td><td>17.8%</td></tr>
+          <tr><td><strong>OPT</strong></td><td>57.2%</td><td>14.9%</td><td>13.4%</td><td>14.5%</td></tr>
+        </tbody>
+      </table></div>
+      <div class="call warn"><span class="k">Read the pie chart</span><p>Matmul is still the majority of latency, but <strong>nonlinear ops are not negligible</strong> (~30% combined), and <strong>"others" such as transposition</strong> take a large slice too. An accelerator that only speeds up matmul leaves nearly half the latency on the table — this is why transformer chips invest in the SFU and in data-layout hardware.</p></div>
+
+      <h3>Tiling large matmuls</h3>
+      <p>Real weight matrices dwarf the compute core, so the operands are <strong>partitioned into tiles</strong> sized to the array. A <span class="mono">512×256</span> by <span class="mono">256×256</span> product is broken into <span class="mono">128×128</span> tiles <span class="mono">A₀₀, B₀₀, …</span>, and the array sweeps tile-by-tile, accumulating partial results.</p>
+
+      <h3>In-place matrix transposition</h3>
+      <p>Forming <span class="mono">Kᵀ</span> naively needs a second buffer. <em class="term">In-place transposition</em> rearranges a matrix <strong>within its existing memory</strong>, needing only minimal extra storage. Row-major <span class="mono">[a b c d; e f g h]</span> stored as <span class="mono">abcdefgh</span> becomes <span class="mono">aebfcgdh</span>.</p>
+      <div class="call key"><span class="k">How it works</span><p>The permutation decomposes into <strong>cycles</strong> — e.g. <span class="mono">(b,c,e)→(e,b,c)</span> and <span class="mono">(d,f,g)→(f,g,d)</span>. Logic reads a few entries, permutes them, and writes them back, following each cycle. Finding swap patterns that <strong>minimize the number of permutations</strong> is a classic problem — Brenner's Algorithm 467 (1973) — and doing it with minimal memory-access cost is what the hardware optimizes.</p></div>
+    </section>
+
+    <hr class="rule">
+
+    <section id="recap">
+      <div class="sec-head"><span class="num">★</span><h2>Exam recap</h2></div>
+      <div class="cards">
+        <div class="card"><p class="q">Accelerator template</p><p>Compute core (Matrix + Vector MAC + SFU) fed by Weight/Activation SRAM. The whole game is keeping the MAC array fed without paying DRAM energy.</p></div>
+        <div class="card"><p class="q">Systolic cell</p><p><span class="mono">z = w·x + y, v = x</span>. Weight-stationary: <var>w</var> resident, data/partial-sums flow, inputs skewed so operands meet partial sums.</p></div>
+        <div class="card"><p class="q">Double buffering</p><p>Ping-pong Mem₁/Mem₂ overlaps DRAM fill with array consume, hiding latency so the array never stalls.</p></div>
+        <div class="card"><p class="q">Column combining</p><p>Pack sparse columns into one array column; keep larger-magnitude weight on collision. 8× smaller, 71.81% vs 69.0% structured.</p></div>
+        <div class="card"><p class="q">Term quantization</p><p>Budget power-of-two terms, not bits. Values need ~2–3 terms; HESE uses signed powers; tMAC turns multiply into exponent-add.</p></div>
+        <div class="card"><p class="q">Multi-resolution</p><p>One meta-model, reusable terms, distillation-trained. Dial budget 60→16 for 3.25× energy at 0.4–3.8% accuracy cost.</p></div>
+        <div class="card"><p class="q">CNN classics</p><p>Diannao (first, NFU 3-stage) · Eyeriss (row-stationary, 12×14 PEs, RLC) · Cnvlutin (skip zero MACs, value+offset).</p></div>
+        <div class="card"><p class="q">Transformer twist</p><p>Matmul ~55% latency, but softmax+layernorm+transpose ~45%. Tile big matmuls; transpose Kᵀ in-place via permutation cycles.</p></div>
+      </div>
+    </section>
+
+    <footer>
+      Study note compiled from <em>Lecture 11 — Transformer LLM Accelerators, NYU SAI Lab, Spring 2026</em>. Key references: Kung &amp; Leiserson 1978 · Kung 1982 · Chen (Diannao) 2014 · Albericio (Cnvlutin) 2016 · Kung, McDanel &amp; Zhang (Column Combining, ASPLOS) 2019 · Kung, McDanel &amp; Zhang (Term Quantization, SC20) 2020 · Zhang et al. (Multi-resolution inference, ASPLOS) 2021 · Brenner (Algorithm 467) 1973 · Chen et al. (Eyeriss). Quantization priors: Li (Ternary), Rastegari (XNOR-Net), Zhou (Incremental).
+    </footer>
+  </main>
+</div>
+<script src="theme.js"></script>
+</body>
+</html>

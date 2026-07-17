@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lecture 09: Distributed Machine Learning — Study Note</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+  <nav class="toc">
+    <a class="home" href="index.html">← All lectures</a>
+    <div class="brand">09 · Distributed ML</div>
+    <a href="#fl"><span class="n">01</span>Federated learning &amp; FedAvg</a>
+    <a href="#fl-problems"><span class="n">02</span>FL challenges &amp; fixes</a>
+    <a class="sub" href="#fl-problems">Non-IID · heterogeneity</a>
+    <a class="sub" href="#fl-problems">Communication · privacy</a>
+    <a href="#data-par"><span class="n">03</span>Data parallelism</a>
+    <a class="sub" href="#data-par">Parameter server</a>
+    <a class="sub" href="#data-par">Ring all-reduce</a>
+    <a href="#model-par"><span class="n">04</span>Model parallelism</a>
+    <a class="sub" href="#model-par">GPipe · PipeDream</a>
+    <a href="#inference"><span class="n">05</span>Distributed inference</a>
+    <a class="sub" href="#inference">BranchyNet · DDNN · ADCNN</a>
+    <a href="#recap"><span class="n">★</span>Exam recap</a>
+  </nav>
+
+  <main>
+    <header class="mast">
+      <p class="eyebrow">Lecture 09 · Study Note</p>
+      <h1>Distributed Machine Learning for Training and Inference</h1>
+      <p class="sub">When one device isn't enough: splitting <strong>data</strong>, <strong>models</strong>, and <strong>inference</strong> across many nodes — federated learning on the edge, data- and model-parallel training in the datacenter, and collaborative inference across cloud, edge, and end devices. The recurring cost is <strong>communication</strong>.</p>
+      <div class="meta-row">
+        <span class="chip">NYU SAI Lab</span>
+        <span class="chip">Spring 2026</span>
+        <span class="chip">FedAvg · ZeRO-free basics</span>
+        <span class="chip">all-reduce · GPipe · early-exit</span>
+      </div>
+    </header>
+
+    <section id="fl">
+      <div class="sec-head"><span class="num">01</span><h2>Federated learning &amp; FedAvg</h2></div>
+      <p class="lede">Train a shared model across many devices that <strong>keep their data local</strong>. The server only ever sees model updates, never the raw samples — privacy by construction.</p>
+
+      <h3>The setting</h3>
+      <p>Each edge device <var>i</var> holds its own examples <span class="mono">(x<sub>i</sub>, y<sub>i</sub>)</span> and trains locally. Only gradients (or weight deltas) are shipped to a central node, which averages them. The global objective is the usual empirical risk, but the data lives on the devices:</p>
+      <div class="formula"><span class="eq">Σ<sub>i=1</sub><sup>4</sup> ‖<var>y</var><sub>i</sub> − <var>F</var>(<var>x</var><sub>i</sub>)‖²</span><span class="lbl">global loss over device data</span></div>
+      <div class="formula"><span class="eq">∇<var>w</var> = (∇<var>w</var><sub>1</sub> + ∇<var>w</var><sub>2</sub> + ∇<var>w</var><sub>3</sub> + ∇<var>w</var><sub>4</sub>) / 4</span><span class="lbl">averaged gradient</span></div>
+      <div class="call key"><span class="k">Why federated learning</span><p><strong>The data never leaves the device.</strong> A powerful DNN can be trained across millions of phones without any user sharing their photos, keystrokes, or health data. Privacy is the whole point — the trade is that the data is now <em class="term">non-IID</em>, devices are <em class="term">heterogeneous</em>, and the link is <em class="term">lossy</em> (see §2).</p></div>
+      <p style="font-size:13px;color:var(--muted)">Source: McMahan et al., <em>"Communication-Efficient Learning of Deep Networks from Decentralized Data,"</em> AISTATS (PMLR) 2017.</p>
+
+      <h3>FedAvg — the four-step round <span class="tag">McMahan 2017</span></h3>
+      <p>One communication round of <em class="term">Federated Averaging</em> repeats four steps:</p>
+      <div class="tbl-scroll"><table>
+        <thead><tr><th>Step</th><th>What happens</th><th>Update</th></tr></thead>
+        <tbody>
+          <tr><td><strong>1 · Broadcast</strong></td><td>Server initializes a global model and sends it to every participating node.</td><td><span class="mono">w<sub>i</sub> = w<sub>global</sub></span> for each <var>i</var></td></tr>
+          <tr><td><strong>2 · Local train</strong></td><td>Each node trains on <em>its own</em> data for a few epochs. Local training length may vary.</td><td><span class="mono">w′<sub>i</sub> = min<sub>w<sub>i</sub></sub> L(F(D<sub>i</sub>), Y<sub>i</sub>)</span></td></tr>
+          <tr><td><strong>3 · Report delta</strong></td><td>Each node sends its local weight change back up to the central node.</td><td><span class="mono">Δw<sub>i</sub> = w − w<sub>i</sub></span></td></tr>
+          <tr><td><strong>4 · Aggregate</strong></td><td>Server averages the deltas to update the global model, then loops.</td><td><span class="mono">w + (1/N) Σ<sub>i</sub> Δw<sub>i</sub></span></td></tr>
+        </tbody>
+      </table></div>
+      <div class="call good"><span class="k">Key idea</span><p>FedAvg pushes <strong>several local SGD steps</strong> before each communication round, not one gradient per round. That amortizes the (expensive) uplink over many cheap local updates — the "communication-efficient" in the paper's title.</p></div>
+    </section>
+
+    <hr class="rule">
+
+    <section id="fl-problems">
+      <div class="sec-head"><span class="num">02</span><h2>Federated learning: the four problems (and fixes)</h2></div>
+      <p class="lede">FL differs from datacenter distributed training in one crucial way: <strong>you don't control the clients.</strong> Their data, speed, link, and trust all vary. Four failure modes follow, each with a proposed remedy.</p>
+
+      <h3>Problem 1 — Non-IID data</h3>
+      <p>Unlike datacenter training where data is shuffled randomly (IID), each device's local data is <strong>highly biased</strong> — one phone sees only dogs, another only cats. Averaging updates from conflicting local optima can <strong>badly degrade the global model.</strong></p>
+      <div class="call bad"><span class="k">How bad</span><p>In extreme <strong>1-class non-IID</strong> (each client holds a single label), test accuracy collapses far below the IID curve on both MNIST and CIFAR-10 across 500 communication rounds. 2-class non-IID is milder but still hurts. <span style="color:var(--muted)">(Zhao et al., 2018.)</span></p></div>
+      <div class="call good"><span class="k">Fix · data sharing</span><p>Zhao et al. propose seeding every device with a <strong>small globally-shared subset</strong> of data. Just <strong>5% shared data raises CIFAR-10 accuracy by ~30%</strong> — a little common ground re-aligns the local optima.</p></div>
+
+      <h3>Problem 1b — Non-IID via a proximal term <span class="tag">FedProx</span></h3>
+      <p>FedProx keeps each device's local solution from drifting too far from the current global weights by adding an <var>ℓ<sub>2</sub></var> proximal penalty to the local objective:</p>
+      <div class="formula"><span class="eq">min<sub>w</sub> h<sub>k</sub>(<var>w</var>; <var>w</var><sup>t</sup>) = F<sub>k</sub>(<var>w</var>) + (μ/2)‖<var>w</var> − <var>w</var><sup>t</sup>‖²</span><span class="lbl">local objective + proximal term</span></div>
+      <ul class="clean">
+        <li>The extra term minimizes the distance between the <strong>initial weight <span class="mono">w<sup>t</sup></span></strong> and the learned weight <span class="mono">w</span>.</li>
+        <li>Guarantees the local update stays close to the global model → stable aggregation under heterogeneity. Devices may return a <span class="mono">γ<sub>k</sub></span>-inexact minimizer (partial local work is fine). <span style="color:var(--muted)">(Li et al., MLSys 2020.)</span></li>
+      </ul>
+
+      <h3>Problem 2 — System heterogeneity</h3>
+      <p>Edge devices differ in processing speed. Because the round can't finish until the slowest device reports, total latency is <strong>bottlenecked by the straggler</strong> → slow convergence.</p>
+      <div class="call good"><span class="k">Fix · HeteroFL</span><p>Instead of forcing every device to train the whole model, <strong>HeteroFL assigns each device a sub-network sized to its compute</strong>. Weak devices train a small slice of the global parameters <span class="mono">W<sub>g</sub></span>; strong devices train more. Nested parameter blocks let the server still aggregate them into one model. <span style="color:var(--muted)">(Diao et al., 2020.)</span></p></div>
+
+      <h3>Problem 3 — Communication</h3>
+      <p>The device↔cloud link can drop or corrupt updates, hurting both latency and accuracy. The remedy is to <strong>transmit fewer, more useful updates.</strong></p>
+      <p><strong>CMFL</strong> scores each local update's <em class="term">relevance</em> to the global direction by how often its per-coordinate sign agrees with the global update's sign:</p>
+      <div class="formula"><span class="eq"><var>e</var>(<strong>u</strong>, <strong>ū</strong>) = (1/N) Σ<sub>j=1</sub><sup>N</sup> 𝕀(sgn(<var>u</var><sub>j</sub>) = sgn(<var>ū</var><sub>j</sub>))</span><span class="lbl">fraction of matching signs</span></div>
+      <ul class="clean">
+        <li><span class="mono">u<sub>j</sub></span> is the sign of the weight after the local update; <span class="mono">ū<sub>j</sub></span> is the global reference.</li>
+        <li><strong>Only devices with high relevance transmit</strong>; irrelevant updates are excluded, cutting communication overhead. <span style="color:var(--muted)">(Luping, Wei &amp; Bo, ICDCS 2019.)</span></li>
+      </ul>
+
+      <h3>Problem 4 — Privacy</h3>
+      <div class="call bad"><span class="k">Gradient leakage</span><p>Even without raw data, an attacker who sees the <strong>transmitted gradients</strong> can <em>reconstruct the original training inputs</em>. "Data never leaves the device" is necessary but not sufficient — the gradients themselves leak.</p></div>
+
+      <h3>Client selection as an RL problem <span class="tag">FedMARL</span></h3>
+      <p>Which clients should participate each round? FedMARL frames it as a multi-objective optimization over a <strong>client-selection matrix</strong> <span class="mono">A = [a<sub>n</sub><sup>t</sup>]</span>, trading final accuracy against training latency and bandwidth:</p>
+      <div class="formula"><span class="eq">max<sub>A</sub> 𝔼[ w<sub>1</sub>·Acc(T) − w<sub>2</sub>·Σ<sub>t∈T</sub> H<sub>t</sub> − w<sub>3</sub>·Σ<sub>t∈T</sub> B<sub>t</sub> ]</span><span class="lbl">accuracy − latency − bandwidth</span></div>
+      <ul class="clean">
+        <li><strong>Acc(T)</strong> = final model accuracy · <strong>Σ H<sub>t</sub></strong> = total training latency · <strong>Σ B<sub>t</sub></strong> = total bandwidth.</li>
+        <li>Weights <span class="mono">w<sub>1</sub>, w<sub>2</sub>, w<sub>3</sub></span> are set by the FL application designer. The problem is hard to solve directly, so it is cast as <strong>multi-agent reinforcement learning (MARL)</strong>.</li>
+        <li>Result: FedMARL beats both random client dropping and plain FedAvg on VGG6 / CIFAR-10 (random dropping already beats FedAvg). <span style="color:var(--muted)">(Zhang, Lin &amp; Zhang, AAAI 2022.)</span></li>
+      </ul>
+    </section>
+
+    <hr class="rule">
+
+    <section id="data-par">
+      <div class="sec-head"><span class="num">03</span><h2>Distributed training: data parallelism</h2></div>
+      <p class="lede">Replicate the <strong>whole model</strong> on every node, split the <strong>batch</strong> across them. Each node computes gradients on its shard; then all gradients are synchronized. Same as FL, but the data is now IID.</p>
+
+      <h3>Batchify, then synchronize</h3>
+      <p>With learning rate <var>η</var> and a mini-batch <var>B</var> of size <var>n</var> per node:</p>
+      <div class="formula"><span class="eq">L(<var>w</var>) = (1/|X|) Σ<sub>x∈X</sub> l(x, <var>w</var>)</span><span class="lbl">loss function</span></div>
+      <div class="formula"><span class="eq"><var>w</var><sub>t+1</sub> = <var>w</var><sub>t</sub> − η·(1/n) Σ<sub>x∈B</sub> ∇l(x, <var>w</var><sub>t</sub>)</span><span class="lbl">weight update</span></div>
+      <p>Example: 4 GPUs each holding a local batch of 64 give a <strong>total batch size of 256</strong>. The only question is <em>how</em> the per-node gradients get summed — this is where the communication schemes differ.</p>
+
+      <h3>Parameter server <span class="tag">Li et al., OSDI 2014</span></h3>
+      <p>A central server holds the authoritative weights. Workers compute gradients, push them to the server, the server aggregates and pushes updated weights back.</p>
+      <div class="formula"><span class="eq">Total communication = 2(N−1)·G</span><span class="lbl">N = #nodes, G = gradient size</span></div>
+      <div class="call bad"><span class="k">Not scalable</span><p>Fault-tolerant (if a worker dies, others continue) — but the <strong>central node is a bottleneck.</strong> As <var>N</var> grows it cannot handle traffic from all workers at once. The whole <span class="mono">2(N−1)G</span> volume funnels through one node.</p></div>
+
+      <h3>All-reduce</h3>
+      <p>Remove the central server: have the nodes sum gradients <em>among themselves</em>. Each round is four stages — <strong>forward pass</strong> (local mini-batch) → <strong>backward pass</strong> (local gradients) → <strong>all-reduce</strong> (sum gradients across all nodes, broadcast the sum) → <strong>parameter update</strong> (each node applies the aggregated gradient to its own replica).</p>
+      <div class="call key"><span class="k">Why all-reduce beats a parameter server</span><p>There is <strong>no single aggregation node</strong>, so no single bottleneck. Every node does an equal share of the communication and ends up with the identical summed gradient. The trick is scheduling the messages so the link load is balanced — that's ring all-reduce.</p></div>
+
+      <h3>Ring all-reduce</h3>
+      <p>Arrange the <var>N</var> nodes in a <strong>ring</strong>. Split each node's gradient into <var>N</var> chunks. The algorithm runs in two phases, each of <var>N−1</var> steps, where every node only ever talks to its neighbor:</p>
+      <ul class="clean">
+        <li><strong>Share-reduce (scatter-reduce) phase:</strong> at each step a node passes one chunk to its neighbor, which <em>adds</em> it to its own. After <var>N−1</var> steps, each node holds one fully-reduced chunk (the sum of that chunk across all nodes).</li>
+        <li><strong>Reduce-only (all-gather) phase:</strong> circulate those completed chunks around the ring so every node ends up with <em>all</em> fully-reduced chunks.</li>
+      </ul>
+      <div class="formula"><span class="eq">Total communication = 2(N−1)·G</span><span class="lbl">same volume as PS…</span></div>
+      <div class="formula"><span class="eq">Per-node bandwidth = 2(N−1)/N · G</span><span class="lbl">…but split evenly across nodes</span></div>
+      <div class="call good"><span class="k">Bandwidth-optimal</span><p>Ring all-reduce moves the <em>same</em> <span class="mono">2(N−1)G</span> total, but <strong>spreads it uniformly</strong> — each node sends/receives only <span class="mono">2(N−1)/N·G</span>, which approaches <span class="mono">2G</span> and is <strong>independent of N</strong>. No node is a bottleneck, so unlike the parameter server it scales. Each node carries an identical workload.</p></div>
+
+      <h3>Communication reduction: Deep Gradient Compression <span class="tag">Lin 2017</span></h3>
+      <p>As node count grows, communication starts to dominate computation on the timeline. DGC shrinks the payload by sending <strong>only the important gradients</strong>:</p>
+      <ul class="clean">
+        <li>Accumulate each layer's gradient locally; transmit a coordinate <strong>only when its magnitude exceeds a threshold</strong> (top <var>s%</var>).</li>
+        <li>Sub-threshold gradients are <strong>kept and accumulated</strong> (via a mask) for later rounds, so no information is lost — just delayed.</li>
+        <li>The resulting sparse gradient is compressed with <strong>run-length encoding</strong> before the all-reduce: <span class="mono">G<sub>t</sub> ← Σ<sub>k</sub> encode(G̃<sub>t</sub><sup>k</sup>)</span>.</li>
+      </ul>
+      <p>Effect on the timeline: with more nodes, communication grows to overlap or exceed computation; DGC shrinks the communication bar back down so compute dominates again.</p>
+    </section>
+
+    <hr class="rule">
+
+    <section id="model-par">
+      <div class="sec-head"><span class="num">04</span><h2>Distributed training: model parallelism</h2></div>
+      <p class="lede">When the model itself is too big for one device, <strong>split the model across devices</strong> — put different layers on different accelerators (pipeline parallelism). The hazard is idle time from sequential dependencies.</p>
+
+      <h3>Naive model parallelism wastes hardware</h3>
+      <p>Place layers on devices 0–3. The forward pass must reach device 3 before the backward pass can start, and each device is idle while the others work. This <strong>severe under-utilization</strong> comes directly from the network's sequential dependency.</p>
+
+      <h3>GPipe — micro-batches <span class="tag">Huang 2019</span></h3>
+      <p>GPipe splits every mini-batch of size <var>N</var> into <var>M</var> equal <strong>micro-batches</strong>, so different accelerators can work on different micro-batches simultaneously — like an assembly line.</p>
+      <div class="call warn"><span class="k">The bubble</span><p>At the start and end of each batch the pipeline isn't full: some devices sit idle. This idle region is the <em class="term">pipeline bubble</em>. More micro-batches (larger <var>M</var>) shrink the bubble's <em>relative</em> cost, since the steady-state region grows while the fixed fill/drain stays the same.</p></div>
+
+      <h3>PipeDream — keep the pipe full <span class="tag">Narayanan 2019</span></h3>
+      <p>PipeDream enables faster DNN training by <strong>combining intra-batch parallelism with inter-batch parallelism</strong>. Instead of finishing one batch before starting the next, workers interleave forward and backward passes of different batches (a "1F1B"-style schedule).</p>
+      <ul class="clean">
+        <li>A <strong>startup state</strong> fills the pipeline; then a <strong>steady state</strong> runs where every worker alternates forward and backward passes with almost no idle time.</li>
+        <li>All inputs in flight <strong>use weights from the last flush</strong>; a periodic <strong>pipeline flush</strong> adds up gradients — the price paid to keep the pipe busy is weight staleness that must be managed.</li>
+      </ul>
+      <div class="call key"><span class="k">GPipe vs PipeDream</span><p>Both attack the bubble. <strong>GPipe</strong> keeps synchronous semantics (flush every mini-batch) and reduces the bubble with many micro-batches. <strong>PipeDream</strong> interleaves batches to eliminate idle time in steady state, trading exact synchrony for throughput.</p></div>
+    </section>
+
+    <hr class="rule">
+
+    <section id="inference">
+      <div class="sec-head"><span class="num">05</span><h2>Distributed &amp; collaborative inference</h2></div>
+      <p class="lede">Not every input needs the full network, and not every layer needs the same device. Three ideas: <strong>exit early</strong> on easy inputs, <strong>split the network</strong> across cloud/edge/device, and <strong>partition the feature maps</strong> across an edge cluster.</p>
+
+      <h3>BranchyNet — early exit <span class="tag">Teerapittayanon 2016</span></h3>
+      <p>Data samples aren't equally hard. Easy CIFAR-10 images can be classified correctly after just a few layers; hard ones need the whole network. BranchyNet attaches <strong>side exits</strong> along the backbone and stops as soon as one is confident.</p>
+      <div class="formula"><span class="eq">entropy(<var>y</var>) = Σ<sub>c∈C</sub> <var>y</var><sub>c</sub> log <var>y</var><sub>c</sub></span><span class="lbl">confidence score at an exit</span></div>
+      <ul class="clean">
+        <li>At each exit compute the entropy of the softmax output. <strong>Low entropy = confident</strong> → emit the result there and skip the rest of the network for faster inference.</li>
+        <li>Train all exits jointly by <strong>summing the cross-entropy loss</strong> at every exit point, each weighted by <span class="mono">w<sub>n</sub></span>:</li>
+      </ul>
+      <div class="formula"><span class="eq">L<sub>branchynet</sub>(ŷ, <var>y</var>; θ) = Σ<sub>n=1</sub><sup>N</sup> w<sub>n</sub> L(ŷ<sub>exit<sub>n</sub></sub>, <var>y</var>; θ)</span><span class="lbl">jointly-trained multi-exit loss</span></div>
+
+      <h3>DDNN — cloud, edge, and end devices <span class="tag">Teerapittayanon 2017</span></h3>
+      <p>Distributed DNNs place the early-exit idea over a computing <em>hierarchy</em>: end devices → edge (fog) → cloud. Three configurations: (a) cloud-only, (b) cloud + device, (c) cloud + geographically distributed devices.</p>
+      <ul class="clean">
+        <li>Each end device runs a small local DNN; a <strong>local aggregator</strong> combines their outputs for a fast <em class="term">local exit</em>.</li>
+        <li>If the local exit isn't confident (<span class="mono">η(x) &lt; T</span>), the <strong>activations after the last conv layer</strong> are sent up to the <strong>cloud aggregator</strong> for the full model — computation offloaded only when needed.</li>
+      </ul>
+      <div class="call good"><span class="k">Why send activations, not raw data</span><p>The local conv layers act as a learned, compact feature extractor. Forwarding their <strong>activation output</strong> (not the raw image) to the cloud saves bandwidth <em>and</em> avoids shipping the raw input — echoing the FL privacy theme.</p></div>
+
+      <h3>ADCNN — partitioning conv across an edge cluster <span class="tag">Zhang 2020</span></h3>
+      <p>For a single big conv layer, split the work across nearby edge devices. Two ways to partition, with very different communication:</p>
+      <div class="tbl-scroll"><table>
+        <thead><tr><th>Partition</th><th>How it splits</th><th>Communication cost</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Channelwise</strong></td><td>Each node owns a subset of channels (<span class="mono">C/2</span>) and all of H×W.</td><td><strong>High</strong> — nodes must exchange partial output feature maps to sum them.</td></tr>
+          <tr><td><strong>Spatial</strong></td><td>Split the input in the spatial dims (<span class="mono">H/2 × W/2</span> tiles); <strong>weights are duplicated</strong> on every device.</td><td>Only the <em class="term">data halo</em> — the thin border of pixels each tile needs from its neighbors.</td></tr>
+        </tbody>
+      </table></div>
+      <div class="call key"><span class="k">Data halo → FDSP</span><p>In spatial partition, a tile needs a border strip from adjacent tiles to compute conv outputs at its edges — the <strong>data halo</strong> — which still costs cross-tile transmission. <strong>FDSP (Fully Decomposable Spatial Partition)</strong> eliminates it entirely by <strong>padding each tile's edge pixels with zeros</strong>, so tiles compute completely independently. No cross-tile transfer at all.</p></div>
+      <ul class="clean">
+        <li>Motivation: profiling VGG16 shows <strong>earlier conv layers take far longer</strong> than later ones — so those are the layers worth distributing.</li>
+        <li>Pipeline: <strong>Step 1 —</strong> progressively retrain the CNN into a distributable form; <strong>Step 2 —</strong> at inference, split the input into tiles, process each on a conv node, and combine at a central node.</li>
+        <li>On 9 Raspberry Pis (8 conv nodes + 1 central), ADCNN cuts average latency by <strong>6.68×</strong> vs a single device and <strong>4.42×</strong> vs remote cloud, across FCN, YOLO, VGG16, ResNet34, CharCNN.</li>
+      </ul>
+    </section>
+
+    <hr class="rule">
+
+    <section id="recap">
+      <div class="sec-head"><span class="num">★</span><h2>Exam recap</h2></div>
+      <div class="cards">
+        <div class="card"><p class="q">FedAvg loop</p><p>Broadcast <span class="mono">w<sub>i</sub>=w<sub>global</sub></span> → local train → send <span class="mono">Δw<sub>i</sub>=w−w<sub>i</sub></span> → aggregate <span class="mono">w+(1/N)ΣΔw<sub>i</sub></span>. Data stays on-device.</p></div>
+        <div class="card"><p class="q">FL's four problems</p><p>Non-IID (fix: data-sharing, FedProx), heterogeneity (HeteroFL), communication (CMFL), privacy (gradient leakage).</p></div>
+        <div class="card"><p class="q">FedProx</p><p>Add proximal term <span class="mono">(μ/2)‖w−w<sup>t</sup>‖²</span> to keep local updates near the global model under non-IID.</p></div>
+        <div class="card"><p class="q">Parameter server</p><p>Comm = 2(N−1)G, all funneled through one node → central bottleneck, not scalable.</p></div>
+        <div class="card"><p class="q">Ring all-reduce</p><p>Share-reduce + reduce-only phases. Same 2(N−1)G total but per-node 2(N−1)/N·G → bandwidth-optimal, scales with N.</p></div>
+        <div class="card"><p class="q">Model parallelism</p><p>GPipe: split into M micro-batches to shrink the bubble. PipeDream: interleave intra + inter-batch to fill the pipe.</p></div>
+        <div class="card"><p class="q">Gradient compression</p><p>DGC sends only gradients above a magnitude threshold, accumulates the rest, RLE-compresses — cuts communication.</p></div>
+        <div class="card"><p class="q">Distributed inference</p><p>BranchyNet exits early on low-entropy inputs; DDNN offloads to cloud only if unconfident; ADCNN tiles conv spatially (FDSP zero-pads to kill the halo).</p></div>
+      </div>
+    </section>
+
+    <footer>
+      Study note compiled from <em>Lecture 09 — Distributed Machine Learning for Training and Inference</em>, NYU SAI Lab, Spring 2026. Key references: McMahan 2017 (FedAvg) · Zhao 2018 (non-IID) · Li 2020 (FedProx) · Diao 2020 (HeteroFL) · Luping 2019 (CMFL) · Zhang 2022 (FedMARL) · Li 2014 (Parameter Server) · Lin 2017 (Deep Gradient Compression) · Huang 2019 (GPipe) · Narayanan 2019 (PipeDream) · Teerapittayanon 2016 (BranchyNet) / 2017 (DDNN) · Kang 2017 (Neurosurgeon) · Zhang 2020 (ADCNN).
+    </footer>
+  </main>
+</div>
+<script src="theme.js"></script>
+</body>
+</html>

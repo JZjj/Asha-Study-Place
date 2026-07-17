@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lecture 10: AI Compiler &amp; CNN Accelerator — Study Note</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+  <nav class="toc">
+    <a class="home" href="index.html">← All lectures</a>
+    <div class="brand">10 · AI Compiler &amp; CNN Accel</div>
+    <a href="#stack"><span class="n">01</span>The compiler stack</a>
+    <a href="#frameworks"><span class="n">02</span>Frameworks &amp; autograd</a>
+    <a class="sub" href="#frameworks">Graph vs eager</a>
+    <a class="sub" href="#frameworks">Non-differentiable ops</a>
+    <a href="#graphopt"><span class="n">03</span>Graph optimization &amp; kernels</a>
+    <a class="sub" href="#graphopt">torch.fx · Triton</a>
+    <a class="sub" href="#graphopt">cuDNN · cuBLAS</a>
+    <a href="#accel"><span class="n">04</span>AI accelerators</a>
+    <a class="sub" href="#accel">CPU→GPU→FPGA→ASIC</a>
+    <a class="sub" href="#accel">Energy hierarchy</a>
+    <a href="#matmul"><span class="n">05</span>Dataflow &amp; data reuse</a>
+    <a href="#cnn"><span class="n">06</span>CNN accelerators</a>
+    <a class="sub" href="#cnn">Cost · im2col · tiling</a>
+    <a href="#systolic"><span class="n">07</span>Systolic arrays</a>
+    <a href="#recap"><span class="n">★</span>Exam recap</a>
+  </nav>
+
+  <main>
+    <header class="mast">
+      <p class="eyebrow">Lecture 10 · Study Note</p>
+      <h1>AI Compilers &amp; the CNN Accelerator</h1>
+      <p class="sub">Two halves of the same story: the <strong>software</strong> path that lowers a Python model into optimized device code, and the <strong>hardware</strong> path — MAC arrays, memory hierarchies, and systolic arrays — that runs it while paying as little for memory as possible.</p>
+      <div class="meta-row">
+        <span class="chip">NYU SAI Lab</span>
+        <span class="chip">Spring 2026</span>
+        <span class="chip">Compiler · IR · fusion</span>
+        <span class="chip">MAC · dataflow · reuse</span>
+        <span class="chip">systolic array · TPU</span>
+      </div>
+    </header>
+
+    <section id="stack">
+      <div class="sec-head"><span class="num">01</span><h2>The ML software–compiler stack</h2></div>
+      <p class="lede">A model written in Python does not run on silicon directly. It is lowered through <strong>five layers</strong>, each converting a higher-level description into something closer to the metal.</p>
+
+      <div class="tbl-scroll"><table>
+        <thead><tr><th>Layer</th><th>Examples</th><th>Job</th></tr></thead>
+        <tbody>
+          <tr><td><strong>ML Frameworks</strong></td><td><span class="mono">PyTorch, TensorFlow, Chainer, Caffe, Theano</span></td><td>High-level interfaces where models are defined, trained, and debugged.</td></tr>
+          <tr><td><strong>IR &amp; Graph Optimization</strong></td><td><span class="mono">TorchDynamo, FX, ONNX</span></td><td>Converts model definitions into an analyzable <em class="term">graph IR</em> for optimization.</td></tr>
+          <tr><td><strong>ML Compiler / Code Gen</strong></td><td><span class="mono">TVM, Triton, ONNX</span></td><td>Translates the IR into optimized <strong>kernels</strong> and executable code for a specific device.</td></tr>
+          <tr><td><strong>Kernel Library</strong></td><td><span class="mono">cuDNN, cuBLAS, CUTLASS</span></td><td>Executes optimized kernels, manages device memory, provides primitives.</td></tr>
+          <tr><td><strong>Hardware Backend</strong></td><td><span class="mono">CPU, GPU, AI Accelerator</span></td><td>The physical devices that execute the compiled, optimized model.</td></tr>
+        </tbody>
+      </table></div>
+      <div class="call key"><span class="k">Why an IR at all</span><p>The framework layer is optimized for <strong>human ergonomics</strong>; hardware wants <strong>regular, analyzable</strong> computation. The IR is the middle ground — a graph the compiler can rewrite, fuse, and re-order before any code is generated. The rest of the lecture is really about the two ends of this stack: the graph on top and the accelerator on the bottom.</p></div>
+    </section>
+
+    <hr class="rule">
+
+    <section id="frameworks">
+      <div class="sec-head"><span class="num">02</span><h2>Frameworks &amp; automatic differentiation</h2></div>
+      <p class="lede">Frameworks split into two execution philosophies, and the choice ripples all the way down to how easy graph optimization becomes.</p>
+
+      <h3>Graph mode vs eager mode</h3>
+      <div class="cards">
+        <div class="card"><p class="q">Graph mode</p><p>Expose a graph-building API: the user <strong>first constructs</strong> a computation graph, then later <strong>executes</strong> it. Theano, Caffe, early TensorFlow.</p></div>
+        <div class="card"><p class="q">Eager mode</p><p>Operations execute <strong>immediately</strong> as they are called in Python, rather than being added to a static graph. PyTorch, Chainer, TensorFlow&nbsp;2.</p></div>
+      </div>
+      <div class="call warn"><span class="k">The trade-off</span><p>Eager mode is easy to write and debug, but the downside is that it makes graph-level optimization <strong>harder for the compiler</strong> — there is no static graph sitting around to rewrite. Graph mode is the opposite: harder to author, but the whole computation is visible up front.</p></div>
+
+      <h3>PyTorch: "everything is just a program" <span class="tag">inherits Chainer</span></h3>
+      <ul class="clean">
+        <li>The DNN model is <em>programmed</em>: the API lets the user freely select the layer configuration (<span class="mono">nn.Module</span>, <span class="mono">forward()</span>).</li>
+        <li>This philosophy is not limited to models — it applies to <strong>optimizers and data loaders</strong> as well.</li>
+        <li>Bidirectional exchange with external libraries: convert between NumPy arrays and tensors via <span class="mono">torch.from_numpy()</span> and <span class="mono">.numpy()</span>.</li>
+        <li>Ships an <em class="term">automatic differentiation</em> engine that performs the gradient computation for you.</li>
+      </ul>
+      <div class="formula"><span class="eq">x = torch.tensor(2.0, requires_grad=True);  y = x*2 + x*3</span><span class="lbl">y.backward() → x.grad</span></div>
+      <p>Autograd records a graph: <span class="mono">y = (2x) + (3x)</span>, each product a node. Calling <span class="mono">y.backward()</span> walks it in reverse and deposits the gradient in <span class="mono">x.grad</span>.</p>
+
+      <h3>Control flow vs data flow</h3>
+      <div class="call key"><span class="k">A strict separation</span><p>PyTorch keeps <strong>control flow</strong> (branches, loops) apart from <strong>data flow</strong> (tensors and their ops). Control flow is resolved by Python + optimized C++ on the <strong>host CPU</strong>, producing a <em>linear sequence of operator invocations</em> on the device. Operators then run on CPU or GPU. Memory is first allocated on the CPU, which manages the allocation and mapping onto the GPU.</p></div>
+
+      <h3>What if the function isn't differentiable?</h3>
+      <p>Autograd needs a gradient. When the op has none (e.g. a hard threshold), the options are:</p>
+      <ul class="clean">
+        <li><strong>Subgradients / piecewise derivatives</strong> — e.g. <span class="mono">y = |x|</span> at <span class="mono">x=0</span> yields <span class="mono">x.grad = 0</span>.</li>
+        <li><strong>Approximation gradients</strong> — substitute a smooth surrogate.</li>
+        <li><strong>Customized gradient definition</strong> — write your own backward.</li>
+        <li><strong>Compilation error</strong> — if none is provided, autograd cannot proceed.</li>
+      </ul>
+      <div class="call good"><span class="k">Straight-Through Estimator (STE)</span><p>For a binary step <span class="mono">y = (x &gt; 0).float()</span> the true gradient is 0 almost everywhere — useless. STE <strong>approximates the gradient as 1</strong> (passes it straight through), so training signal still flows. In a custom <span class="mono">torch.autograd.Function</span>, the backward returns a surrogate such as <span class="mono">grad_output * (|x| ≤ 1)</span>.</p></div>
+
+      <h3>TensorFlow: the static-graph counterpoint</h3>
+      <ul class="clean">
+        <li>Open-source framework by Google (2015); supports CPU, GPU, and <strong>TPU</strong> acceleration across CNNs, RNNs, Transformers, RL, and scientific computing.</li>
+        <li>Builds a <strong>static computation graph</strong> (predefined dataflow): <em>nodes = operations</em>, <em>edges = data (tensors)</em>.</li>
+        <li>Because the whole graph is known, it is <strong>optimizable and deployable</strong> across hardware, and enables <strong>parallelism</strong> and <strong>graph-level optimizations</strong>.</li>
+      </ul>
+      <div class="formula"><span class="eq">z = x * y  →  Tensor("mul:0", shape=(), dtype=float32)</span><span class="lbl">nothing runs — graph only</span></div>
+      <p>In TF1 <span class="mono">z</span> is just a graph node until <span class="mono">sess.run(z)</span> materializes it (<span class="mono">12.0</span>). In TF2's eager mode the same line executes immediately and prints <span class="mono">tf.Tensor(12.0, …)</span>.</p>
+    </section>
+
+    <hr class="rule">
+
+    <section id="graphopt">
+      <div class="sec-head"><span class="num">03</span><h2>Graph-level optimization &amp; kernels</h2></div>
+      <p class="lede">Once the computation is a graph, the compiler can rewrite it into a cheaper but numerically equivalent graph — then hand the pieces to hand-tuned kernel libraries.</p>
+
+      <h3>The canonical rewrite</h3>
+      <div class="formula"><span class="eq">y = x*2 + x*3   ≡   y = x*(2+3)</span><span class="lbl">2 mults + 1 add → 1 add + 1 mult</span></div>
+      <p>The left graph has two multiply nodes feeding an add. The right graph folds <span class="mono">2+3</span> into a constant <span class="mono">5</span> and does a single multiply — same result, fewer operations. This is exactly the kind of rewrite eager mode makes harder, because the graph must be recovered before it can be transformed.</p>
+
+      <h3>torch.fx <span class="tag">capture &amp; transform</span></h3>
+      <p><span class="mono">torch.fx.symbolic_trace(model)</span> captures the <span class="mono">forward()</span> as an explicit graph of nodes — <span class="mono">placeholder</span>, <span class="mono">call_module</span>, <span class="mono">call_function</span> — that you can inspect and rewrite:</p>
+      <div class="formula"><span class="eq">%relu_1 = call_function[target=relu](args=(%fc1,))  →  %relu_2 = call_function[target=relu](args=(%relu_1,))</span><span class="lbl">two ReLUs in a row = redundant</span></div>
+      <div class="call good"><span class="k">Concrete pass: remove redundant ReLU</span><p>Walk <span class="mono">gm.graph.nodes</span>; when a <span class="mono">call_function</span> node is <span class="mono">relu</span> and the previous op was also <span class="mono">relu</span>, <strong>skip it</strong> (<span class="mono">continue</span>), copying every other node into a new graph. Wrapping the result in <span class="mono">torch.fx.GraphModule</span> yields an optimized model. torch.fx gives the flexibility to <em>modify and transform the computation graph</em>, enabling performance and efficiency improvements.</p></div>
+
+      <h3>Triton <span class="tag">Python that compiles to GPU</span></h3>
+      <ul class="clean">
+        <li>Open-source compiler and language (originally Harvard/OpenAI, now integrated into PyTorch). Writing efficient GPU kernels in raw CUDA is complex and error-prone.</li>
+        <li>Lets you write custom GPU kernels <strong>in Python</strong> and reach <strong>CUDA-level performance</strong> with far simpler code — researchers often need <em>custom fused kernels</em> beyond what cuDNN/cuBLAS offer.</li>
+        <li><strong>Automatic tiling &amp; vectorization</strong> for performance portability, and <strong>fusion-friendly</strong>: integrates with PyTorch's graph optimizers.</li>
+        <li>A <span class="mono">@triton.jit</span> matmul kernel uses <span class="mono">tl.program_id</span>, <span class="mono">tl.arange</span>, <span class="mono">tl.load</span>, <span class="mono">tl.dot</span>, <span class="mono">tl.store</span> — Python-like syntax with compiler-grade optimization.</li>
+      </ul>
+
+      <h3>Kernel libraries: cuDNN, cuBLAS, CUTLASS</h3>
+      <div class="tbl-scroll"><table>
+        <thead><tr><th>Library</th><th>Specializes in</th><th>Notes</th></tr></thead>
+        <tbody>
+          <tr><td><strong>cuDNN</strong></td><td>Deep-learning-specific ops: convolutions, pooling, normalization, activations (ReLU/tanh/sigmoid), RNN/LSTM</td><td>Auto-used by TF, PyTorch, JAX. Enables Tensor Cores, mixed precision, and algorithm autotuning.</td></tr>
+          <tr><td><strong>cuBLAS</strong></td><td>General linear algebra: matrix–matrix / matrix–vector (<span class="mono">GEMM</span>), scaling, dot products</td><td>Underpins dense layers &amp; attention. Supports <strong>FP16 / BF16</strong> on modern GPUs.</td></tr>
+          <tr><td><strong>CUTLASS</strong></td><td>Composable templates for building custom GEMM/conv kernels</td><td>Sits alongside cuBLAS in the kernel-library layer.</td></tr>
+        </tbody>
+      </table></div>
+      <div class="call key"><span class="k">The division of labor</span><p><strong>cuDNN accelerates deep-learning-specific ops; cuBLAS accelerates general linear algebra.</strong> Both are critical layers of the GPU software stack that make frameworks like TensorFlow and PyTorch fast.</p></div>
+    </section>
+
+    <hr class="rule">
+
+    <section id="accel">
+      <div class="sec-head"><span class="num">04</span><h2>AI accelerators: the hardware landscape</h2></div>
+      <p class="lede">GPUs win on throughput but are general-purpose and power-hungry. Specializing the silicon trades flexibility for energy efficiency — that trade is the whole design space.</p>
+
+      <h3>Why not just use CPUs and GPUs?</h3>
+      <ul class="clean">
+        <li><strong>GPU &gt; CPU</strong> for both training and inference throughput — it leverages a highly parallel architecture and reaches <strong>10×–20× higher throughput</strong> than a CPU.</li>
+        <li>But GPUs are <strong>general purpose</strong>, have <strong>high power consumption and latency</strong>, and <strong>do not support sophisticated pruning and quantization</strong> algorithms in hardware.</li>
+        <li><strong>ASIC</strong> implementations accelerate inference: Google TPU, Apple Neural Engine, Cerebras AI chip.</li>
+        <li><strong>FPGA</strong> accelerators offer good programmability &amp; flexibility, short development cycles, and serve as a <em>benchmark before committing to an ASIC</em> (e.g. Xilinx Alveo card).</li>
+      </ul>
+
+      <h3>The flexibility ↔ efficiency spectrum</h3>
+      <div class="spectrum" aria-hidden="true">
+        <div class="bar"><span style="background:var(--accent)"></span><span style="background:var(--accent-2);opacity:.78"></span><span style="background:var(--accent-2);opacity:.55"></span><span style="background:var(--accent-2);opacity:.35"></span><span style="background:#b8b8b8"></span></div>
+        <div class="labels"><div><b>ASIC</b>TOPS/W</div><div><b>CGRA</b></div><div><b>FPGA</b></div><div><b>GPU</b></div><div><b>CPU</b>MOPS/W · most flexible</div></div>
+      </div>
+      <div class="call key"><span class="k">Read the spectrum</span><p><strong>ASIC</strong> offers the highest energy efficiency (TOPS/W) but is only suitable for specific applications. <strong>CPU</strong> is fully general-purpose but has the lowest energy efficiency. CGRA (coarse-grained reconfigurable array) and FPGA sit in between — reconfigurable fabrics that recover some efficiency without hard-wiring one function.</p></div>
+
+      <h3>Anatomy of an AI accelerator</h3>
+      <p>The accelerator is one device on a <em class="term">Network-on-Chip (NoC)</em> alongside the CPU and GPU, all sharing DRAM. It executes the part of the machine code related to the AI workload — a Python conv can be compiled to a bitstream and dispatched to the accelerator.</p>
+      <ul class="clean">
+        <li><strong>DRAM</strong> — large off-chip memory (~GB).</li>
+        <li><strong>Register file (RF)</strong> and on-chip <strong>Weight SRAM</strong> / <strong>Activation SRAM</strong> — staging buffers close to compute.</li>
+        <li><strong>Compute core</strong> — a <strong>Matrix MAC</strong> array for 2D matrix multiply, a <strong>Vector MAC</strong>, and a <strong>Special Function Unit</strong> (activations, etc.).</li>
+      </ul>
+
+      <h3>The energy hierarchy <span class="tag">why memory dominates</span></h3>
+      <p>Every operand read costs energy, and cost explodes as you move away from the ALU. Normalized to a single ALU operation:</p>
+      <div class="tbl-scroll"><table>
+        <thead><tr><th>Access</th><th>Size</th><th>Normalized energy</th></tr></thead>
+        <tbody>
+          <tr><td><strong>ALU</strong> (compute)</td><td>—</td><td><span class="mono">1× (reference)</span></td></tr>
+          <tr><td>Register file (RF)</td><td>0.5–1.0 kB</td><td><span class="mono">1×</span></td></tr>
+          <tr><td>PE (across 200–1000 PEs)</td><td>NoC</td><td><span class="mono">2×</span></td></tr>
+          <tr><td>Buffer</td><td>100–500 kB</td><td><span class="mono">6×</span></td></tr>
+          <tr><td><strong>DRAM</strong></td><td>~GB</td><td><span class="mono">200×</span></td></tr>
+        </tbody>
+      </table></div>
+      <div class="call bad"><span class="k">The 200× rule</span><p>A DRAM access costs roughly <strong>200× a compute op</strong>. This single fact drives nearly every accelerator design decision: <em>the arithmetic is cheap; moving the data is what you pay for.</em> Maximizing on-chip <strong>data reuse</strong> to avoid DRAM trips is the central optimization.</p></div>
+    </section>
+
+    <hr class="rule">
+
+    <section id="matmul">
+      <div class="sec-head"><span class="num">05</span><h2>Matrix multiply on the accelerator: dataflow &amp; reuse</h2></div>
+      <p class="lede">Walking a 2×2 matmul through the hardware shows exactly where memory traffic comes from — and how reordering the computation cuts it without changing the result.</p>
+
+      <div class="formula"><span class="eq">[W₀₀ W₀₁; W₁₀ W₁₁] × [X₀₀ X₀₁; X₁₀ X₁₁] = [Y₀₀ Y₀₁; Y₁₀ Y₁₁]</span><span class="lbl">Yᵢⱼ = Σ Wᵢ·Xⱼ</span></div>
+      <p>Each output <span class="mono">Y₀₀ = W₀₀X₀₀ + W₀₁X₁₀</span> is built by streaming weights from Weight SRAM and activations from Activation SRAM into the compute core, accumulating partial sums, and writing results back out to DRAM. Done naively, every partial product re-fetches operands from memory.</p>
+
+      <div class="call key"><span class="k">Memory access reduction</span><p>The computation and memory-access pattern <strong>can be changed to minimize cost without impacting the result</strong>. If <span class="mono">W₀₁</span> is already loaded, arrange the schedule so <em>every</em> output that needs <span class="mono">W₀₁</span> consumes it before it is evicted — one load, many uses.</p></div>
+      <div class="call good"><span class="k">Maximize reuse of loaded data</span><p>It is preferable to minimize memory access by <strong>maximizing the reuse</strong> of already-loaded operands. A weight held stationary in the compute core (recall the 200× DRAM penalty) amortizes its expensive fetch across many MACs. Scheduling neural-network layer accesses to minimize memory usage is developed further in the next lecture.</p></div>
+    </section>
+
+    <hr class="rule">
+
+    <section id="cnn">
+      <div class="sec-head"><span class="num">06</span><h2>CNN accelerators: cost, im2col, tiling</h2></div>
+      <p class="lede">The convolution is the core building block of a CNN and its <strong>most compute-intensive</strong> layer. Understanding its cost and how to reshape it into a matmul is the key to accelerating it.</p>
+
+      <h3>Computational cost of a convolution</h3>
+      <p>A conv maps input feature maps <var>(B, C, H, W)</var> through <var>M</var> filters of kernel size <var>K×K</var> to outputs <var>(B, M, E, F)</var>. Iterating over <strong>seven dimensions</strong> — <var>B, M, C, E, F,</var> and the two kernel axes <var>K, K</var>:</p>
+      <div class="formula"><span class="eq">MACs = <var>B</var>×<var>M</var>×<var>K</var>×<var>K</var>×<var>C</var>×<var>E</var>×<var>F</var></span><span class="lbl">multiply-accumulates</span></div>
+      <div class="formula"><span class="eq">Storage = 32 × (<var>M·C·K·K</var> + <var>B·C·H·W</var> + <var>B·M·E·F</var>) bits</span><span class="lbl">weights + in-act + out-act, FP32</span></div>
+      <ul class="clean">
+        <li><var>B</var> batch · <var>C</var> input channels · <var>H,W</var> input map size · <var>M</var> filters · <var>K</var> kernel size · <var>E,F</var> output map size.</li>
+      </ul>
+
+      <h3>The 7-deep loop nest is the dataflow</h3>
+      <div class="formula"><span class="eq">for b, m, c, w(→E), h(→F), k₁, k₂:  out[b][m][e][f] += in[b][c][e+k₁−(K+1)/2][f+k₂−(K+1)/2] · filter[m][c][k₁][k₂]</span><span class="lbl">the whole convolution</span></div>
+      <div class="call key"><span class="k">Dataflow = how you order the loops</span><p>This simple loop nest can be transformed in <strong>numerous ways</strong> to capture different reuse patterns of activations and weights, and to map the computation onto hardware. <em>A CNN's dataflow defines how the loops are ordered, partitioned, and parallelized.</em> A single scalar multiplier could execute the whole thing via this for-loop — slowly.</p></div>
+
+      <h3>Scalar → vector → matrix machines</h3>
+      <div class="cards">
+        <div class="card"><p class="q">Scalar multiplier</p><p><span class="mono">z = xy</span>. Most flexible, least efficient. The CPU/GPU per-element view.</p></div>
+        <div class="card"><p class="q">Vector multiplier</p><p><span class="mono">z = xᵀy</span>. A dot product per step — CPU &amp; GPU SIMD lanes.</p></div>
+        <div class="card"><p class="q">Matrix multiplier</p><p><span class="mono">Z = XY</span>. Whole matmul as one op — the <strong>TPU</strong> model. Most efficient, least flexible.</p></div>
+      </div>
+      <p>The same flexibility↔efficiency trade returns: the scalar machine is maximally flexible; the matrix machine is maximally efficient.</p>
+
+      <h3>im2col: turning convolution into GEMM</h3>
+      <p>A standard convolution <strong>can be converted to a 2D matrix multiplication</strong> using the <em class="term">Im2Col</em> operation. Each sliding receptive field is flattened into a row of an input matrix; filters flatten into columns:</p>
+      <div class="formula"><span class="eq">[BEF × CK²]  ×  [CK² × M]  =  [BEF × M]</span><span class="lbl">input matrix × filters = output</span></div>
+      <p>The reshaped input feature maps (rows = each output position, width <span class="mono">K = Cᵢ·Hf·Wf</span>) multiply the filter matrix to produce the output feature maps. This lets the mature, highly-tuned GEMM path (cuBLAS, systolic arrays) run the convolution — at the cost of duplicating overlapping pixels in the unrolled matrix.</p>
+
+      <h3>Tiling</h3>
+      <div class="call good"><span class="k">Decompose the big matmul</span><p>To handle matrix multiplication at large sizes, it is decomposed into <strong>tiles</strong>: in <span class="mono">[W₀₀ W₀₁; W₁₀ W₁₁] × [X₀₀ X₀₁; …]</span>, each <span class="mono">Wᵢⱼ</span> and <span class="mono">Xᵢⱼ</span> can itself be a <em>sub-matrix</em>. Tiles are sized to fit on-chip SRAM so operands are loaded once and reused across the tile — directly attacking the DRAM cost.</p></div>
+    </section>
+
+    <hr class="rule">
+
+    <section id="systolic">
+      <div class="sec-head"><span class="num">07</span><h2>Systolic arrays &amp; DNN hardware</h2></div>
+      <p class="lede">The dominant matmul engine: a 2D grid of MAC cells through which data <em>rhythmically flows</em>, each cell reusing a stationary weight so operands are fetched from memory only once.</p>
+
+      <h3>The building blocks of a DNN processor</h3>
+      <ul class="clean">
+        <li><strong>Processing engine</strong> — the MAC datapath.</li>
+        <li><strong>Accumulator</strong> — sums partial products.</li>
+        <li><strong>Register file</strong> — local operands.</li>
+        <li><strong>Special function unit</strong> — activations and non-linear ops.</li>
+        <li><strong>Memory subsystem</strong> — Weight SRAM, Data SRAM, DRAM, behind a memory controller with read/write control bits.</li>
+      </ul>
+
+      <h3>Spatial architecture &amp; double buffering</h3>
+      <div class="call key"><span class="k">Spatial computing</span><p>A grid of PEs fed from memory forms a <em class="term">spatial architecture</em>. It can achieve great <strong>reuse of the extracted content</strong> — a weight <span class="mono">W₁</span> loaded once is shared across many PEs and cycles — <strong>reducing memory access cost</strong>. This is data reuse realized in space rather than time.</p></div>
+      <div class="call good"><span class="k">Double buffering</span><p>Give the systolic array <strong>two memory banks</strong> (<span class="mono">Mem₁</span>, <span class="mono">Mem₂</span>). While the array <em>consumes</em> from one bank, DRAM <em>fills</em> the other; then they swap. Overlapping data <strong>production and consumption</strong> hides transfer latency and keeps the array continuously fed — no stalls waiting on DRAM.</p></div>
+
+      <h3>The systolic array <span class="tag">weight-stationary</span></h3>
+      <ul class="clean">
+        <li>Kung &amp; Leiserson, <em>"Systolic Arrays for VLSI"</em> (1978) and Kung, <em>"Why Systolic Architectures?"</em> (1982).</li>
+        <li>A <strong>2D grid of multiplier-accumulators (MACs)</strong> performing matrix multiplication.</li>
+        <li>Used by the <strong>Google TPU</strong> for deep learning (2017), among others.</li>
+      </ul>
+      <p>Each <em class="term">systolic cell</em> takes streaming inputs <var>x</var> (from below) and <var>y</var> (from the left), holds a <strong>stationary weight <var>w</var></strong> in the MAC, and outputs:</p>
+      <div class="formula"><span class="eq">z = w·x + y      v = x</span><span class="lbl">MAC to the right · pass x up</span></div>
+      <p>Worked cell: with <span class="mono">w=6, x=4, y=2</span> → <span class="mono">z = 6·4 + 2 = 26</span> flows right, and <span class="mono">v = x = 4</span> flows up to the next row.</p>
+
+      <div class="call key"><span class="k">How a full multiply runs</span><p>Weights are <strong>preloaded</strong> into the array (weight-stationary). Data enters <strong>skewed</strong> (diagonally staggered) from the edges so that each partial product <span class="mono">w·x</span> meets the correct incoming partial sum <span class="mono">y</span> at the right cycle. Partial sums accumulate as they march across the array, and after the pipeline fills, each cycle emits another column of the result matrix. For <span class="mono">[2 −1 1; −2 3 −4] × [1 0; 0 3; −2 2]</span>, the skewed stream produces <span class="mono">[0 −1; 6 1]</span> — the whole GEMM computed with each weight fetched exactly once.</p></div>
+      <div class="call good"><span class="k">Why this wins</span><p>Every weight is loaded once and reused across the entire data stream; every partial sum stays on-chip, hopping cell-to-cell instead of round-tripping to DRAM. Combined with the 200× DRAM penalty, that reuse is exactly why systolic arrays are the heart of TPU-class accelerators.</p></div>
+    </section>
+
+    <hr class="rule">
+
+    <section id="recap">
+      <div class="sec-head"><span class="num">★</span><h2>Exam recap</h2></div>
+      <div class="cards">
+        <div class="card"><p class="q">The 5-layer stack</p><p>Framework → IR/graph-opt → ML compiler/codegen → kernel library → hardware. The IR is the analyzable graph the compiler rewrites.</p></div>
+        <div class="card"><p class="q">Graph vs eager</p><p>Graph mode = build-then-run (optimizable). Eager mode = run-immediately (easy, but harder to optimize).</p></div>
+        <div class="card"><p class="q">Non-diff ops</p><p>Subgradient, approximation, custom backward, or error. STE approximates the gradient as 1 so signal flows.</p></div>
+        <div class="card"><p class="q">Graph rewrite</p><p><span class="mono">x*2+x*3 ≡ x*(2+3)</span>. torch.fx traces &amp; transforms; e.g. drop redundant consecutive ReLU.</p></div>
+        <div class="card"><p class="q">Kernel libs</p><p>cuDNN = DL-specific ops (conv, pooling, RNN). cuBLAS = general GEMM. Triton = Python GPU kernels with auto-tiling.</p></div>
+        <div class="card"><p class="q">Flexibility ↔ efficiency</p><p>CPU → GPU → FPGA → CGRA → ASIC. Right = most efficient (TOPS/W), left = most flexible.</p></div>
+        <div class="card"><p class="q">Energy hierarchy</p><p>ALU 1× · RF 1× · PE 2× · Buffer 6× · <strong>DRAM 200×</strong>. Moving data, not computing, is the cost.</p></div>
+        <div class="card"><p class="q">Conv cost</p><p>MACs = B·M·K·K·C·E·F, seven nested loops. The loop ordering <em>is</em> the dataflow.</p></div>
+        <div class="card"><p class="q">im2col + tiling</p><p>im2col reshapes conv → GEMM <span class="mono">[BEF×CK²]·[CK²×M]</span>. Tiling fits sub-matrices on-chip for reuse.</p></div>
+        <div class="card"><p class="q">Systolic array</p><p>Kung 1978, TPU 2017. Cell: <span class="mono">z=w·x+y, v=x</span>. Stationary weights + skewed data = each operand fetched once.</p></div>
+      </div>
+    </section>
+
+    <footer>
+      Study note compiled from <em>Lecture 10 — AI Compiler and CNN Accelerator</em>, NYU SAI Lab, Spring 2026. Key references: Paszke et al. (PyTorch, NeurIPS 2019) · Ansel et al. (PyTorch 2, ASPLOS 2024) · Abadi et al. (TensorFlow, OSDI 2016) · Tillet, Kung &amp; Cox (Triton, MAPL 2019) · Chetlur et al. (cuDNN, arXiv:1410.0759, 2014) · Kung &amp; Leiserson (Systolic Arrays for VLSI, 1978) · Kung (Why Systolic Architectures?, 1982) · Google TPU (2017).
+    </footer>
+  </main>
+</div>
+<script src="theme.js"></script>
+</body>
+</html>
